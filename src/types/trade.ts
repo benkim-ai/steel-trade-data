@@ -1,5 +1,5 @@
 /** `/api/trade` ↔ 프론트 공통 시계열 행 (금액: 백만 USD) */
-export type TradeApiType = "overall" | "item" | "country" | "continent";
+export type TradeApiType = "overall" | "nitemtrade" | "continent";
 
 export type TradeRow = {
   month: string;

@@ -83,6 +83,14 @@ const ITEM_PATHS: string[][] = [
   ["getAdmstListResponse", "Body", "Items", "Item"],
   ["admstListResponse", "body", "items", "item"],
   ["admstListResponse", "Body", "Items", "Item"],
+  ["getNitemtradeListResponse", "body", "items", "item"],
+  ["getNitemtradeListResponse", "Body", "Items", "Item"],
+  ["nitemtradeListResponse", "body", "items", "item"],
+  ["nitemtradeListResponse", "Body", "Items", "Item"],
+  ["getContinenttradeListResponse", "body", "items", "item"],
+  ["getContinenttradeListResponse", "Body", "Items", "Item"],
+  ["continenttradeListResponse", "body", "items", "item"],
+  ["continenttradeListResponse", "Body", "Items", "Item"],
 ];
 
 export function extractItemsFromParsed(
@@ -111,7 +119,21 @@ function normalizeMonthKey(raw: string): string | null {
   return null;
 }
 
+/** 품목·국가별 API `year` 필드: "2016.01" → "2016-01" */
+function monthFromYearDotField(item: Record<string, unknown>): string | null {
+  const y = pickString(item, ["year", "Year"]);
+  if (!y) return null;
+  const m = y.match(/^(\d{4})\.(\d{2})/);
+  if (!m) return null;
+  const mi = Number(m[2]);
+  if (mi < 1 || mi > 12) return null;
+  return `${m[1]}-${m[2]}`;
+}
+
 function monthFromItem(item: Record<string, unknown>): string | null {
+  const fromYearDot = monthFromYearDotField(item);
+  if (fromYearDot) return fromYearDot;
+
   const combined = pickString(item, [
     "statsYyMm",
     "statsYymm",
@@ -147,10 +169,34 @@ function monthFromItem(item: Record<string, unknown>): string | null {
   return null;
 }
 
+export type TradeXmlDirection = "import" | "export";
+
 /** 공공포털 XML `item` → 월별 중량·금액(USD 원 → 백만 USD) */
 export function itemRecordToTradeRow(
   item: Record<string, unknown>,
+  tradeDirection?: TradeXmlDirection,
 ): TradeRow | null {
+  if (tradeDirection === "export" || tradeDirection === "import") {
+    const month = monthFromYearDotField(item) ?? monthFromItem(item);
+    if (!month) return null;
+
+    const weight = pickNumber(
+      item,
+      tradeDirection === "export" ? ["expWgt", "expwgt"] : ["impWgt", "impwgt"],
+    );
+    const usdRaw = pickNumber(
+      item,
+      tradeDirection === "export" ? ["expDlr", "expdlr"] : ["impDlr", "impdlr"],
+    );
+    const amountMillionUsd = usdRaw / 1_000_000;
+
+    return {
+      month,
+      weight,
+      amount: Math.round(amountMillionUsd * 1_000_000) / 1_000_000,
+    };
+  }
+
   const month = monthFromItem(item);
   if (!month) return null;
 
@@ -190,10 +236,11 @@ export function itemRecordToTradeRow(
 
 export function normalizeItemsToRows(
   items: Record<string, unknown>[],
+  tradeDirection?: TradeXmlDirection,
 ): TradeRow[] {
   const rows: TradeRow[] = [];
   for (const it of items) {
-    const row = itemRecordToTradeRow(it);
+    const row = itemRecordToTradeRow(it, tradeDirection);
     if (row) rows.push(row);
   }
   return rows;
@@ -255,6 +302,7 @@ function extractOpenApiError(parsed: unknown): {
 export function parseTradeXmlToRows(
   text: string,
   httpStatus: number,
+  options?: { tradeDirection?: TradeXmlDirection },
 ): { rows: TradeRow[]; debug: TradeParseDebug } {
   const rawXmlPreview = text.replace(/^\uFEFF/, "").substring(0, 500);
 
@@ -277,7 +325,9 @@ export function parseTradeXmlToRows(
   const std = extractStandardHeader(parsed);
   const oa = extractOpenApiError(parsed);
   const { items, usedPath } = extractItemsFromParsed(parsed);
-  const normalized = mergeRowsByMonth(normalizeItemsToRows(items));
+  const normalized = mergeRowsByMonth(
+    normalizeItemsToRows(items, options?.tradeDirection),
+  );
 
   const firstItemKeys =
     items[0] && typeof items[0] === "object"

@@ -1,4 +1,7 @@
-/** 공공데이터 API 코드 매핑 (엑셀/문서 기준) */
+/**
+ * 공공데이터 API 코드 매핑 (레거시·참고용).
+ * 국가 cntyCd 전체 목록은 `customsCountryCodes.ts`(관세청조회코드 엑셀 국가코드 시트)를 사용하세요.
+ */
 
 /** 수출입구분코드 (imexTpcd) */
 export const imexTpcd = {
