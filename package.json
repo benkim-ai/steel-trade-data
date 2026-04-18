@@ -9,6 +9,9 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "echarts": "^6.0.0",
+    "echarts-for-react": "^3.0.6",
+    "fast-xml-parser": "^5.7.1",
     "next": "16.2.4",
     "react": "19.2.4",
     "react-dom": "19.2.4"
