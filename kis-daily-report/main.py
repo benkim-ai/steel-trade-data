@@ -8,9 +8,6 @@ from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import tool
 
-# ===== LangChain Import =====
-from langchain_community.tools import DuckDuckGoSearchRun
-
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
@@ -31,7 +28,7 @@ def get_kis_access_token():
     if _kis_token_cache["token"] and now < _kis_token_cache["expires_at"]:
         return _kis_token_cache["token"]
 
-    # 실전투자용 URL로 변경
+    # 실전투자용 URL
     url = "https://openapi.koreainvestment.com:9443/oauth2/tokenP"
     res = requests.post(url, json={
         "grant_type": "client_credentials",
@@ -43,12 +40,57 @@ def get_kis_access_token():
     if "access_token" not in data:
         raise RuntimeError(f"❌ KIS 토큰 발급 실패: {data}")
 
-    # 들여쓰기 에러 수정 (공백 4칸)
     token = f"Bearer {data['access_token']}"
     _kis_token_cache["token"] = token
     _kis_token_cache["expires_at"] = now + 86400
     print("✅ KIS 액세스 토큰 자동 발급 완료")
     return token
+
+# ===== 네이버 검색 API 헬퍼 함수 =====
+def naver_search(query: str, display: int = 5, sort: str = "date") -> str:
+    """네이버 뉴스 검색 API를 호출하여 결과를 텍스트로 반환"""
+    client_id = os.getenv("NAVER_CLIENT_ID")
+    client_secret = os.getenv("NAVER_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        return "❌ 네이버 API 키가 설정되지 않았습니다. .env에 NAVER_CLIENT_ID, NAVER_CLIENT_SECRET을 추가하세요."
+
+    url = "https://openapi.naver.com/v1/search/news.json"
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret
+    }
+    params = {
+        "query": query,
+        "display": display,
+        "sort": sort  # date: 최신순, sim: 정확도순
+    }
+
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        if res.status_code != 200:
+            return f"❌ 네이버 검색 API 오류 (HTTP {res.status_code}): {res.text}"
+
+        data = res.json()
+        items = data.get("items", [])
+
+        if not items:
+            return f"'{query}'에 대한 검색 결과가 없습니다."
+
+        results = []
+        for i, item in enumerate(items, 1):
+            # HTML 태그 제거
+            title = item["title"].replace("<b>", "").replace("</b>", "")
+            desc = item["description"].replace("<b>", "").replace("</b>", "")
+            pub_date = item.get("pubDate", "")
+            results.append(f"{i}. [{title}] {desc} ({pub_date})")
+
+        return "\n".join(results)
+
+    except requests.exceptions.Timeout:
+        return f"❌ 네이버 검색 타임아웃: '{query}'"
+    except Exception as e:
+        return f"❌ 네이버 검색 중 오류 발생: {str(e)}"
 
 # ===== 도구(Tools) 정의 =====
 @tool("fetch_kis_portfolio")
@@ -57,9 +99,9 @@ def fetch_kis_portfolio() -> str:
     # 1. 토큰 발급 (KIS API 필수)
     token = get_kis_access_token()
 
-    # 2. 계좌 조회 (실전투자용 URL 및 tr_id 변경)
+    # 2. 계좌 조회 (실전투자용 URL)
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
-    
+
     # 계좌번호 파싱 (하이픈 기준 분리)
     account_full = os.getenv("KIS_ACCOUNT", "")
     if "-" in account_full:
@@ -72,7 +114,7 @@ def fetch_kis_portfolio() -> str:
         "authorization": token,
         "appkey": os.getenv("KIS_APP_KEY"),
         "appsecret": os.getenv("KIS_APP_SECRET"),
-        "tr_id": "TTTC8434R" # 실전투자용 주식잔고조회 TR ID
+        "tr_id": "TTTC8434R"  # 실전투자용 주식잔고조회 TR ID
     }
     params = {
         "CANO": cano,
@@ -83,53 +125,73 @@ def fetch_kis_portfolio() -> str:
     }
     res = requests.get(url, headers=headers, params=params)
     data = res.json()
-    
+
     if res.status_code != 200:
         return f"⚠️ KIS API 오류: {data.get('msg1', '알 수 없음')}"
-        
+
     holdings = data.get("output1", [])
     summary = data.get("output2", [{}])[0] if isinstance(data.get("output2"), list) else data.get("output2", {})
-    
+
     out = f"총평가금액: {summary.get('tot_evlu_amt','0')}원\n"
     out += f"평가손익: {summary.get('scts_evlu_pfls_amt','0')}원\n"
     out += f"수익률: {summary.get('pfls_rt','0')}%\n"
     out += f"예수금: {summary.get('dnca_tot_amt','0')}원\n\n보유종목:\n"
-    for h in holdings[:5]:
+    for h in holdings[:10]:
         out += f"- {h['prdt_name']}({h['pdno']}): {h['hldg_qty']}주 / 수익률 {h['evlu_pfls_rt']}% / 평가손익 {h['evlu_pfls_amt']}원\n"
     return out
 
 @tool("search_stock_context")
 def search_stock_context(query: str) -> str:
-    """주식 종목에 대한 최신 뉴스 및 컨텍스트 검색"""
-    search = DuckDuckGoSearchRun()
-    try:
-        result = search.run(query)
-        return result
-    except Exception as e:
-        return f"검색 중 오류 발생: {str(e)}"
+    """네이버 뉴스 검색 API로 주식 종목의 최신 뉴스 및 컨텍스트 검색.
+    종목명 또는 종목코드를 포함한 검색어를 입력하면 최신 뉴스 5건을 반환합니다.
+    예: 'SK하이닉스 주가 전망', '삼성전자 실적'"""
+    # 뉴스 검색 (최신순 5건)
+    news_result = naver_search(query + " 주식", display=5, sort="date")
+
+    # 추가로 증권사 리포트/분석 검색 (정확도순 3건)
+    analysis_result = naver_search(query + " 증권사 목표가 분석", display=3, sort="sim")
+
+    output = f"=== [{query}] 최신 뉴스 ===\n{news_result}\n\n"
+    output += f"=== [{query}] 증권사 분석 ===\n{analysis_result}"
+    return output
 
 @tool("send_telegram")
 def send_telegram(message: str) -> str:
     """텔레그램으로 메시지 발송"""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
+
     if not bot_token or not chat_id:
         return "텔레그램 봇 토큰 또는 챗 ID가 설정되지 않았습니다."
-        
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    
+
+    # 텔레그램 메시지 길이 제한 (4096자) 처리
+    max_len = 4096
+    if len(message) <= max_len:
+        chunks = [message]
+    else:
+        # 긴 메시지는 분할 발송
+        chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
+
     try:
-        res = requests.post(url, json=payload)
-        if res.status_code == 200:
-            return "텔레그램 발송 성공"
-        else:
-            return f"텔레그램 발송 실패: {res.text}"
+        for i, chunk in enumerate(chunks):
+            payload = {
+                "chat_id": chat_id,
+                "text": chunk,
+                "parse_mode": "Markdown"
+            }
+            res = requests.post(url, json=payload)
+            if res.status_code != 200:
+                # Markdown 파싱 실패 시 일반 텍스트로 재시도
+                payload["parse_mode"] = None
+                res = requests.post(url, json=payload)
+                if res.status_code != 200:
+                    return f"텔레그램 발송 실패 (파트 {i+1}): {res.text}"
+            if len(chunks) > 1:
+                time.sleep(0.5)  # 분할 발송 시 딜레이
+
+        return f"텔레그램 발송 성공 ({len(chunks)}개 메시지)"
     except Exception as e:
         return f"텔레그램 발송 중 오류 발생: {str(e)}"
 
@@ -144,8 +206,9 @@ data_agent = Agent(
 
 research_agent = Agent(
     role="Korean Market Research Analyst",
-    goal="보유 종목별 최신 뉴스/시세 분석 및 모멘텀/리스크 도출",
-    backstory="국내 증시 전문 애널리스트로 데이터 기반 인사이트와 명확한 모멘텀/리스크 분류에 강하며, 증권사 리포트를 매일 분석합니다.",
+    goal="보유 종목별 최신 뉴스/시세 분석 및 모멘텀/리스크 도출. 각 종목을 하나씩 순서대로 검색하세요.",
+    backstory="""국내 증시 전문 애널리스트로 데이터 기반 인사이트와 명확한 모멘텀/리스크 분류에 강하며, 증권사 리포트를 매일 분석합니다.
+검색 시 종목을 하나씩 순서대로 검색하세요. 동시에 여러 종목을 검색하지 마세요.""",
     tools=[search_stock_context],
     llm=llm
 )
@@ -176,7 +239,9 @@ task_data = Task(
 )
 
 task_research = Task(
-    description="각 보유 종목의 최신 뉴스/시세/증권사 의견을 조사하세요. 출력 형식: '종목명(코드): 뉴스요약 | 모멘텀 | 리스크'",
+    description="""각 보유 종목의 최신 뉴스/시세/증권사 의견을 조사하세요.
+중요: 종목을 하나씩 순서대로 검색하세요. 동시에 여러 종목을 검색하면 안 됩니다.
+출력 형식: '종목명(코드): 뉴스요약 | 모멘텀 | 리스크'""",
     expected_output="종목별 컨텍스트 요약",
     agent=research_agent
 )

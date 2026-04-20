@@ -8,9 +8,6 @@ langchain-openai
 langchain-community
 openai
 
-# ===== 검색 도구 =====
-duckduckgo-search
-
 # ===== 환경 변수 =====
 python-dotenv
 
