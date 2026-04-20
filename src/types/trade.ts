@@ -1,8 +1,9 @@
-/** `/api/trade` ↔ 프론트 공통 시계열 행 (금액: 백만 USD) */
+/** `/api/trade` ↔ 프론트 공통 시계열 행 (금액: 백만 USD, 중량: 천톤) */
 export type TradeApiType = "overall" | "nitemtrade" | "continent";
 
 export type TradeRow = {
   month: string;
+  /** 천톤 (10⁶ kg). 관세청 XML의 kg를 파싱·합산 단계에서 변환 */
   weight: number;
   amount: number;
 };

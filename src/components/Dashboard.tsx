@@ -10,6 +10,7 @@ import {
   type CustomsCountryId,
 } from "@/constants/customsCountryCodes";
 import { HS_CODE_MAP } from "@/constants/hsCodes";
+import { COUNTRY_FILTER_ALL } from "@/constants/mappings";
 import { TradeChart } from "@/components/TradeChart";
 import type { TradeApiResponse, TradeRow } from "@/types/trade";
 
@@ -19,8 +20,11 @@ export type TradeDirection = "import" | "export";
 
 export type RegionScopeTab = "country" | "continent";
 
+/** 국가별: 단일 cntyCd 또는 전체 합계(ALL) */
+export type CountryChoiceId = CustomsCountryId | typeof COUNTRY_FILTER_ALL;
+
 type EnrichedRow = TradeRow & {
-  /** 백만 USD·kg 기준 단가 지표 (기존과 동일: (amount×1000)/weight, 톤당 백만 USD 스케일) */
+  /** 수입·수출 단가 = 금액×1000/중량(천톤) — 금액 백만 USD, 예: 33.27·42.29 → ≈787 */
   unitPrice: number;
   /** 중량 전년 동월比(YoY) */
   yoyDisplay: string;
@@ -38,7 +42,7 @@ type FilterSnapshot = {
   startMonth: string;
   endMonth: string;
   productKey: string;
-  countryId: CustomsCountryId;
+  countryId: CountryChoiceId;
   continentCode: CustomsContinentCode;
 };
 
@@ -59,9 +63,12 @@ function addCalendarMonthsYm(ym: string, delta: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
+/** 수입·수출 단가: 금액(백만 USD)×1000 ÷ 중량(천톤) */
 function unitPriceFromRow(row: TradeRow): number {
-  if (row.weight === 0) return 0;
-  return Math.round(((row.amount * 1000) / row.weight) * 10) / 10;
+  const { amount, weight } = row;
+  if (weight === 0 || !Number.isFinite(weight)) return 0;
+  if (!Number.isFinite(amount)) return 0;
+  return (amount * 1000) / weight;
 }
 
 function pctDisplay(v: number): string {
@@ -142,9 +149,28 @@ function regionLabelFromSnap(s: FilterSnapshot): string {
       String(s.continentCode);
     return `${name}(대륙) · ${s.productKey}`;
   }
+  if (s.countryId === COUNTRY_FILTER_ALL) {
+    return `전체 합계(모든 국가) · ${s.productKey}`;
+  }
   const cname =
     CUSTOMS_COUNTRY_OPTIONS.find((o) => o.id === s.countryId)?.name ?? s.countryId;
   return `${cname} · ${s.productKey}`;
+}
+
+/** 차트 회색 막대 범례: 「일본산 중후판」형 (대륙은 ○○산 품목, 전체는 전체 품목) */
+function tradeChartBarLegend(s: FilterSnapshot): string {
+  if (s.regionTab === "continent") {
+    const name =
+      CUSTOMS_CONTINENT_OPTIONS.find((o) => o.code === s.continentCode)?.name ??
+      String(s.continentCode);
+    return `${name}산 ${s.productKey}`;
+  }
+  if (s.countryId === COUNTRY_FILTER_ALL) {
+    return `전체 ${s.productKey}`;
+  }
+  const cname =
+    CUSTOMS_COUNTRY_OPTIONS.find((o) => o.id === s.countryId)?.name ?? s.countryId;
+  return `${cname}산 ${s.productKey}`;
 }
 
 function apiLabelForTab(tab: RegionScopeTab): string {
@@ -163,7 +189,7 @@ function RegionScopeTabs({
     { id: "continent", label: "대륙별" },
   ];
   return (
-    <div className="flex flex-wrap gap-1 border-b border-slate-200">
+    <div className="flex flex-wrap gap-1 border-b border-slate-300">
       {items.map((item) => {
         const active = item.id === value;
         return (
@@ -171,10 +197,10 @@ function RegionScopeTabs({
             key={item.id}
             type="button"
             onClick={() => onChange(item.id)}
-            className={`px-4 py-2 text-sm -mb-px border-b-2 font-medium transition-colors ${
+            className={`px-4 py-2.5 text-base -mb-px border-b-2 font-semibold transition-colors ${
               active
                 ? "border-brand-navy text-brand-navy"
-                : "border-transparent text-slate-500 hover:text-slate-800"
+                : "border-transparent text-slate-700 hover:text-slate-900"
             }`}
           >
             {item.label}
@@ -195,7 +221,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
     : (HS_PRODUCT_KEYS[0] ?? "");
 
   const [regionTab, setRegionTab] = useState<RegionScopeTab>("country");
-  const [countryId, setCountryId] = useState<CustomsCountryId>(DEFAULT_COUNTRY);
+  const [countryId, setCountryId] = useState<CountryChoiceId>(DEFAULT_COUNTRY);
   const [continentCode, setContinentCode] =
     useState<CustomsContinentCode>(DEFAULT_CONTINENT);
   const [countryQuery, setCountryQuery] = useState("");
@@ -215,7 +241,6 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
   const [rawRows, setRawRows] = useState<TradeRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [fetchNotice, setFetchNotice] = useState<string | null>(null);
 
   const snapRef = useRef<FilterSnapshot>({
     regionTab: "country",
@@ -253,7 +278,6 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
       setLoading(true);
       setRawRows([]);
       setFetchError(null);
-      setFetchNotice(null);
       const { start, end } = normalizeMonthRange(snap.startMonth, snap.endMonth);
       /** 표·차트 첫 달 YoY용: 전년 동월이 되도록 조회 시작 12개월 앞부터 받음 */
       const apiStartYm = addCalendarMonthsYm(start, -12);
@@ -301,7 +325,6 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
         }
         setRawRows(Array.isArray(body.rows) ? body.rows : []);
         if (body.error) setFetchError(body.error);
-        if (body.notice) setFetchNotice(body.notice);
       } catch (e) {
         setRawRows([]);
         setFetchError(e instanceof Error ? e.message : String(e));
@@ -379,25 +402,21 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
   const imexLabel = tradeDirection === "import" ? "수입" : "수출";
   const pageTitle = `${imexLabel} 대시보드`;
   const unitPriceColumnLabel =
-    tradeDirection === "import" ? "수입단가" : "수출단가";
+    tradeDirection === "import" ? "수입단가(백만 USD)" : "수출단가(백만 USD)";
 
   const regionLabel = useMemo(() => regionLabelFromSnap(applied), [applied]);
 
-  const conditionSummary = useMemo(() => {
-    return `조회 반영 조건: [${imexLabel}] / [${apiLabelForTab(applied.regionTab)}] / ${regionLabel} / ${formatMonthDot(applied.startMonth)}~${formatMonthDot(applied.endMonth)}`;
+  /** 차트 상단 전용(헤더와 동일 내용, 접두 없이 강조 표시) */
+  const chartAppliedConditionsText = useMemo(() => {
+    return `[${imexLabel}] / [${apiLabelForTab(applied.regionTab)}] / ${regionLabel} / ${formatMonthDot(applied.startMonth)}~${formatMonthDot(applied.endMonth)}`;
   }, [applied, imexLabel, regionLabel]);
 
-  const draftHint = useMemo(() => {
-    const r = regionLabelFromSnap({
-      regionTab,
-      countryId,
-      continentCode,
-      productKey,
-      startMonth,
-      endMonth,
-    });
-    return `편집 중: [${apiLabelForTab(regionTab)}] / ${r} · ${formatMonthDot(startMonth)}~${formatMonthDot(endMonth)} (조회하기로 조건 고정)`;
-  }, [continentCode, countryId, endMonth, productKey, regionTab, startMonth]);
+  /** PNG 저장 시 파일명 앞부분 (예: `미국 · 중후판 / 2020.01~2023.05`) */
+  const chartSaveImageNameStem = useMemo(
+    () =>
+      `${regionLabelFromSnap(applied)} / ${formatMonthDot(applied.startMonth)}~${formatMonthDot(applied.endMonth)}`,
+    [applied],
+  );
 
   const chartCategories = filteredRows.map((r) => formatMonthDot(r.month));
   const chartMonths = filteredRows.map((r) => r.month);
@@ -438,20 +457,11 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
           <h1 className="text-xl font-semibold tracking-tight text-slate-900 md:text-2xl">
             {pageTitle}
           </h1>
-          <p
-            className="mt-1 truncate text-sm font-medium text-slate-700"
-            title={conditionSummary}
-          >
-            {conditionSummary}
-          </p>
-          <p className="mt-1 truncate text-xs text-slate-400" title={draftHint}>
-            {draftHint}
-          </p>
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-6 lg:flex-row lg:gap-8 lg:p-8">
-        <section className="flex w-full min-w-0 flex-col gap-6 lg:w-3/4">
+        <section className="flex w-full min-w-0 flex-col gap-6 lg:w-[62%]">
           <div className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80">
             <p className="text-xs font-medium text-slate-500">{introApiLine}</p>
           </div>
@@ -462,22 +472,28 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             </div>
           ) : null}
 
-          <article className="flex min-h-[400px] flex-col rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200/80">
+          <article className="flex min-h-[320px] flex-col rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200/80">
             <div className="mb-2 flex items-start justify-between gap-4">
               <div>
                 <h2 className="text-base font-semibold text-slate-900">월별 추이</h2>
-                <p className="mt-0.5 text-xs text-slate-500">
-                  {regionLabel} · {apiLabelForTab(applied.regionTab)} · 좌측 막대(천톤 또는 금액),
-                  우측 선(전년 동월 대비 %, 표와 동일) · 긴 기간은 하단 슬라이더로 이동 · 우상단 PNG 저장
-                </p>
-                {fetchNotice ? (
-                  <p className="mt-1 text-xs text-amber-700">{fetchNotice}</p>
-                ) : null}
               </div>
               {loading ? (
                 <span className="text-xs font-medium text-slate-500">불러오는 중…</span>
               ) : null}
             </div>
+
+            <div
+              className="mb-4 rounded-xl border border-brand-navy/20 bg-gradient-to-br from-slate-50 to-brand-navy/[0.06] px-4 py-3.5 shadow-inner ring-1 ring-slate-200/80"
+              aria-label="차트에 적용된 조회 조건"
+            >
+              <p className="text-[11px] font-bold uppercase tracking-wide text-brand-navy">
+                차트 적용 조건
+              </p>
+              <p className="mt-2 break-words text-sm font-semibold leading-relaxed text-slate-900">
+                {chartAppliedConditionsText}
+              </p>
+            </div>
+
             {!loading && filteredRows.length === 0 ? (
               <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50/80 py-24 text-center">
                 <p className="text-base font-semibold text-slate-700">데이터 없음</p>
@@ -506,8 +522,9 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                 yoyPctAmount={yoyPctAmountLine}
                 unitPrices={chartUnitPrices}
                 yoyPctUnitPrice={yoyPctUnitPriceLine}
-                productLabel={applied.productKey}
+                barLegendText={tradeChartBarLegend(applied)}
                 imexLabel={imexLabel}
+                saveImageNameStem={chartSaveImageNameStem}
               />
             ) : null}
           </article>
@@ -519,7 +536,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                 <thead>
                   <tr className="bg-slate-100/80 text-slate-600">
                     <th className="px-4 py-3 font-semibold">월</th>
-                    <th className="px-4 py-3 font-semibold">중량(kg)</th>
+                    <th className="px-4 py-3 font-semibold">중량(천톤)</th>
                     <th className="px-4 py-3 font-semibold">중량 증감률(YoY)</th>
                     <th className="px-4 py-3 font-semibold">금액(백만 USD)</th>
                     <th className="px-4 py-3 font-semibold">금액 증감률(YoY)</th>
@@ -545,7 +562,10 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                           {formatMonthDot(row.month)}
                         </td>
                         <td className="px-4 py-3 tabular-nums">
-                          {row.weight.toLocaleString()}
+                          {row.weight.toLocaleString(undefined, {
+                            maximumFractionDigits: 6,
+                            minimumFractionDigits: 0,
+                          })}
                         </td>
                         <td className={`px-4 py-3 tabular-nums ${yoyClass(row.yoyValue)}`}>
                           {row.yoyDisplay}
@@ -563,7 +583,9 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                           {row.yoyAmountDisplay}
                         </td>
                         <td className="px-4 py-3 tabular-nums">
-                          {row.unitPrice.toFixed(1)}
+                          {Number.isFinite(row.unitPrice)
+                            ? Math.round(row.unitPrice).toLocaleString()
+                            : "-"}
                         </td>
                         <td
                           className={`px-4 py-3 tabular-nums ${yoyClass(row.unitPriceYoyValue)}`}
@@ -584,26 +606,46 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
           </article>
         </section>
 
-        <aside className="flex w-full shrink-0 flex-col gap-6 rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200/80 lg:w-1/4">
+        <aside className="flex w-full shrink-0 flex-col gap-6 rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-300/90 lg:w-[38%]">
           <div>
-            <h2 className="text-lg font-semibold text-slate-900">조건 설정</h2>
-            <p className="mt-1 text-sm text-slate-500">
+            <h2 className="text-xl font-bold tracking-tight text-slate-900">조건 설정</h2>
+            <p className="mt-2 text-sm leading-relaxed text-slate-700">
               기간·필터를 맞춘 뒤{" "}
-              <span className="font-medium text-slate-700">조회하기</span>로 상단 요약
-              조건을 확정합니다. (외부 API는 서버{" "}
-              <code className="text-xs">/api/trade</code>만 경유)
+              <span className="font-semibold text-slate-900">조회하기</span>로 조건을 확정합니다.
+              (외부 API는 서버 <code className="rounded bg-slate-200/90 px-1 py-0.5 text-xs text-slate-800">/api/trade</code>만 경유)
             </p>
           </div>
 
-          <div className="rounded-2xl bg-slate-50/80 p-1 ring-1 ring-slate-100">
+          <div className="rounded-2xl bg-slate-100/90 p-1 ring-1 ring-slate-200">
             <RegionScopeTabs value={regionTab} onChange={setRegionTab} />
           </div>
 
           {regionTab === "country" ? (
             <fieldset className="space-y-2">
-              <legend className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+              <legend className="text-sm font-bold tracking-tight text-slate-900">
                 국가 (cntyCd)
               </legend>
+              <p className="text-xs leading-relaxed text-slate-600">
+                전체 합계는 관세청 국가코드 목록 전체에 대해 조회한 뒤 월별 중량·금액을 합산합니다. 데이터량이
+                많아 조회가 오래 걸릴 수 있습니다.
+              </p>
+              <label
+                className={`flex cursor-pointer items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm transition-colors ${
+                  countryId === COUNTRY_FILTER_ALL
+                    ? "border-brand-navy/20 bg-white font-medium text-brand-navy shadow-sm ring-1 ring-slate-200/80"
+                    : "bg-slate-50 text-slate-800 ring-1 ring-slate-100 hover:bg-white/90"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name={countryGroupName}
+                  checked={countryId === COUNTRY_FILTER_ALL}
+                  onChange={() => setCountryId(COUNTRY_FILTER_ALL)}
+                  className="h-4 w-4 shrink-0 border-slate-300 text-brand-navy focus:ring-brand-navy"
+                />
+                <span className="tabular-nums text-slate-500">ALL</span>
+                <span className="min-w-0 flex-1 font-medium">전체 합계</span>
+              </label>
               <input
                 type="search"
                 value={countryQuery}
@@ -643,7 +685,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             </fieldset>
           ) : (
             <fieldset className="space-y-2">
-              <legend className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+              <legend className="text-sm font-bold tracking-tight text-slate-900">
                 대륙 (cntnEbkUnfcClsfCd)
               </legend>
               <div className="space-y-1 rounded-xl bg-slate-50 p-2 ring-1 ring-slate-100">
@@ -672,12 +714,12 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
           )}
 
           <div className="space-y-3">
-            <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+            <span className="text-sm font-bold tracking-tight text-slate-900">
               기간
             </span>
             <div className="flex flex-col gap-3">
-              <label className="block text-sm text-slate-600">
-                <span className="mb-1.5 block text-xs font-medium text-slate-500">
+              <label className="block text-sm text-slate-800">
+                <span className="mb-1.5 block text-sm font-semibold text-slate-800">
                   시작 월
                 </span>
                 <input
@@ -687,8 +729,8 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                   className={inputClass}
                 />
               </label>
-              <label className="block text-sm text-slate-600">
-                <span className="mb-1.5 block text-xs font-medium text-slate-500">
+              <label className="block text-sm text-slate-800">
+                <span className="mb-1.5 block text-sm font-semibold text-slate-800">
                   종료 월
                 </span>
                 <input
@@ -701,11 +743,11 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             </div>
           </div>
 
-          <fieldset className="min-h-0 flex-1 space-y-3">
-            <legend className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+          <fieldset className="shrink-0 space-y-3">
+            <legend className="text-sm font-bold tracking-tight text-slate-900">
               품목 (HS 코드 그룹)
             </legend>
-            <p className="text-xs text-slate-500">
+            <p className="text-xs leading-relaxed text-slate-600">
               선택한 품목의 HS 코드 전체를 서버에서 병렬 조회·월별 합산합니다.
             </p>
             <div className="max-h-[min(36vh,280px)] space-y-1 overflow-y-auto rounded-xl bg-slate-50 p-2 ring-1 ring-slate-100">
@@ -736,7 +778,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             type="button"
             onClick={handleSearch}
             disabled={loading}
-            className="mt-auto w-full rounded-xl bg-blue-600 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 enabled:active:scale-[0.99] disabled:opacity-60"
+            className="w-full shrink-0 rounded-xl bg-blue-600 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 enabled:active:scale-[0.99] disabled:opacity-60"
           >
             {loading ? "조회 중…" : "조회하기"}
           </button>

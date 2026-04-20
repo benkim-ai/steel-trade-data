@@ -4,14 +4,15 @@ import type { EChartsOption } from "echarts";
 import { useMemo, useState } from "react";
 import ReactECharts from "echarts-for-react";
 
-type VolumeMetric = "weight" | "amount";
+/** 우측 파란 선: 단가(표와 동일 지표) 또는 중량 전년동월 증감률 */
+type RightLineMode = "unitPrice" | "yoy";
 
 type TradeChartProps = {
   /** X축 라벨 (예: 2020.01) */
   categories: string[];
   /** YoY·정렬용 원본 월 `YYYY-MM` */
   months: string[];
-  /** kg */
+  /** 중량(천톤) — 좌축 막대와 동일 단위 */
   weightsKg: number[];
   /** 백만 USD */
   amountsMillionUsd: number[];
@@ -19,18 +20,33 @@ type TradeChartProps = {
   yoyPctWeight: (number | null)[];
   /** 전년 동월 대비 금액 증감률(%) — 동일 길이 */
   yoyPctAmount: (number | null)[];
-  /** 표와 동일한 단가 지표 (amount×1000/weight) */
+  /** 표와 동일: 단가 = 금액×1000/중량(천톤) */
   unitPrices: number[];
   /** 단가 지표 전년 동월比(%) */
   yoyPctUnitPrice: (number | null)[];
-  /** 범례용 (예: 철근) */
-  productLabel: string;
+  /** 회색 막대 범례 (예: 일본산 중후판) */
+  barLegendText: string;
   /** 수입 | 수출 */
   imexLabel: string;
+  /** PNG 저장 파일명 앞부분 (예: `미국 · 중후판 / 2020.01~2023.05`) */
+  saveImageNameStem: string;
 };
 
 const BAR_GRAY = "#c0c0c0";
 const LINE_BLUE = "#003399";
+
+/** Windows 등에서 금지된 문자만 처리. `/`는 전각 `／`로 바꿔 표시에 가깝게 유지 */
+function buildChartExportFileName(stem: string, line: RightLineMode): string {
+  const base = stem
+    .replace(/[/\\]/g, "\uFF0F")
+    .replace(/[:*?"<>|]/g, "-")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, 120);
+  const suffix = line === "unitPrice" ? "단가" : "증감률";
+  const core = base.length > 0 ? base : "chart";
+  return `${core}-${suffix}`;
+}
 
 export function TradeChart({
   categories,
@@ -41,10 +57,11 @@ export function TradeChart({
   yoyPctAmount,
   unitPrices,
   yoyPctUnitPrice,
-  productLabel,
+  barLegendText,
   imexLabel,
+  saveImageNameStem,
 }: TradeChartProps) {
-  const [metric, setMetric] = useState<VolumeMetric>("weight");
+  const [rightLine, setRightLine] = useState<RightLineMode>("yoy");
 
   const hasData =
     categories.length > 0 &&
@@ -58,25 +75,31 @@ export function TradeChart({
 
   const barValues = useMemo(() => {
     if (!hasData) return [];
-    if (metric === "weight") {
-      return weightsKg.map((w) => Math.round((w / 1000) * 1000) / 1000);
-    }
-    return amountsMillionUsd.map((a) => Math.round(a * 1000) / 1000);
-  }, [amountsMillionUsd, hasData, metric, weightsKg]);
+    return weightsKg.map((w) => Math.round(w * 1000) / 1000);
+  }, [hasData, weightsKg]);
 
   const lineData = useMemo(() => {
-    const src = metric === "weight" ? yoyPctWeight : yoyPctAmount;
-    return src.map((v) => (v === null || Number.isNaN(v) ? ("-" as const) : v));
-  }, [metric, yoyPctAmount, yoyPctWeight]);
+    if (!hasData) return [];
+    if (rightLine === "unitPrice") {
+      return unitPrices.map((v) =>
+        v === null || v === undefined || !Number.isFinite(v)
+          ? ("-" as const)
+          : Math.round(v),
+      );
+    }
+    return yoyPctWeight.map((v) => (v === null || Number.isNaN(v) ? ("-" as const) : v));
+  }, [hasData, rightLine, unitPrices, yoyPctWeight]);
 
-  const barLegend =
-    metric === "weight"
-      ? `${productLabel} ${imexLabel}량(좌)`
-      : `${productLabel} ${imexLabel}금액(좌)`;
-  const lineLegend = "증감률(우)";
-  const leftUnit = metric === "weight" ? "(천톤)" : "(백만 USD)";
-  const pngName =
-    metric === "weight" ? "trade-volume-yoy-chart" : "trade-amount-yoy-chart";
+  const barLegend = barLegendText;
+  const lineLegend =
+    rightLine === "unitPrice" ? `${imexLabel}단가(우)` : "증감률(우)";
+  const leftUnit = "(천톤)";
+  const rightAxisUnit = rightLine === "unitPrice" ? "(달러/톤)" : "(%)";
+
+  const saveImageFileName = useMemo(
+    () => buildChartExportFileName(saveImageNameStem, rightLine),
+    [rightLine, saveImageNameStem],
+  );
 
   const n = categories.length;
   const useDataZoom = n > 24;
@@ -99,7 +122,7 @@ export function TradeChart({
 
     const rightAxis: EChartsOption["yAxis"] = {
       type: "value",
-      name: "(%YoY)",
+      name: rightAxisUnit,
       nameLocation: "end",
       nameTextStyle: { align: "right", color: "#444", fontSize: 11 },
       position: "right",
@@ -110,18 +133,18 @@ export function TradeChart({
       scale: true,
     };
 
-    const xAxisLabelFormatter = (value: string) => {
-      const m = /^(\d{4})\.(\d{2})$/.exec(value);
-      if (!m) return value;
-      return `'${m[1].slice(-2)}`;
-    };
-
-    /** 1월(YYYY.01)에만 연도 축 라벨 — 긴 시계열에서 겹침 방지 */
-    const xAxisLabelInterval = (index: number, value: string) => {
-      void index;
+    /** 매 월 칸은 두되 라벨은 연도 전환·1월·구간 첫 달에만 'YY (같은 해 반복 방지) */
+    const xAxisLabelFormatter = (value: string, index: number) => {
       const m = /^(\d{4})\.(\d{2})$/.exec(String(value));
-      if (!m) return true;
-      return m[2] !== "01";
+      if (!m) return String(value);
+      const yy = `'${m[1].slice(-2)}`;
+      if (index === 0) return yy;
+      if (m[2] === "01") return yy;
+      const prevVal = categories[index - 1];
+      const pm =
+        typeof prevVal === "string" ? /^(\d{4})\.(\d{2})$/.exec(prevVal) : null;
+      if (pm && pm[1] !== m[1]) return yy;
+      return "";
     };
 
     const dataZoom: EChartsOption["dataZoom"] = useDataZoom
@@ -160,20 +183,18 @@ export function TradeChart({
           const idx = axis.dataIndex ?? 0;
           const cat = axis.axisValue ?? "";
           const b = barValues[idx];
-          const srcYoy = metric === "weight" ? yoyPctWeight : yoyPctAmount;
-          const y = srcYoy[idx];
-          const yStr =
-            y === null || y === undefined || Number.isNaN(y)
-              ? "-"
-              : `${y > 0 ? "+" : ""}${y.toFixed(1)}%`;
-          const volUnit = metric === "weight" ? "천톤" : "백만 USD";
           const fmtPct = (v: number | null | undefined) =>
             v === null || v === undefined || Number.isNaN(v)
               ? "-"
               : `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
           const up = unitPrices[idx];
-          const upStr = up !== undefined ? up.toFixed(1) : "-";
-          return `<div style="font-size:12px;line-height:1.55"><strong>${cat}</strong><br/>${barLegend}: ${b?.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${volUnit}<br/>${lineLegend}: ${yStr} (표와 동일·전년 동월比)<br/>────────<br/>중량 YoY: ${fmtPct(yoyPctWeight[idx])}<br/>금액 YoY: ${fmtPct(yoyPctAmount[idx])}<br/>${imexLabel}단가: ${upStr}<br/>단가 YoY: ${fmtPct(yoyPctUnitPrice[idx])}</div>`;
+          const upStr =
+            up !== undefined && Number.isFinite(up) ? String(Math.round(up)) : "-";
+          const linePrimary =
+            rightLine === "unitPrice"
+              ? `${lineLegend}: ${upStr} (표와 동일)`
+              : `${lineLegend}: ${fmtPct(yoyPctWeight[idx])} (중량·전년 동월比)`;
+          return `<div style="font-size:12px;line-height:1.55"><strong>${cat}</strong><br/>${barLegend}: ${b?.toLocaleString(undefined, { maximumFractionDigits: 2 })} 천톤<br/>${linePrimary}<br/>────────<br/>금액 YoY: ${fmtPct(yoyPctAmount[idx])}<br/>${imexLabel}단가: ${upStr}<br/>단가 YoY: ${fmtPct(yoyPctUnitPrice[idx])}</div>`;
         },
       },
       toolbox: {
@@ -183,7 +204,7 @@ export function TradeChart({
           saveAsImage: {
             show: true,
             title: "PNG 저장",
-            name: pngName,
+            name: saveImageFileName,
             pixelRatio: 2,
           },
         },
@@ -200,7 +221,7 @@ export function TradeChart({
         left: 56,
         right: 56,
         top: 52,
-        bottom: useDataZoom ? 52 : 40,
+        bottom: useDataZoom ? 56 : 44,
         containLabel: false,
       },
       dataZoom,
@@ -213,7 +234,7 @@ export function TradeChart({
         axisLabel: {
           color: "#555",
           fontSize: 11,
-          interval: xAxisLabelInterval,
+          interval: 0,
           formatter: xAxisLabelFormatter,
         },
       },
@@ -249,16 +270,17 @@ export function TradeChart({
       ],
     };
   }, [
-    barLegend,
+    barLegendText,
     barMaxWidth,
     barValues,
     categories,
     hasData,
     leftUnit,
     lineLegend,
-    metric,
+    rightAxisUnit,
+    rightLine,
     n,
-    pngName,
+    saveImageFileName,
     useDataZoom,
     lineData,
     yoyPctAmount,
@@ -273,7 +295,7 @@ export function TradeChart({
   if (!hasData) {
     return (
       <div
-        className="flex h-[400px] w-full flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50 text-center text-sm text-slate-600"
+        className="flex h-[320px] w-full flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50 text-center text-sm text-slate-600"
         role="status"
       >
         <p className="font-semibold text-slate-700">차트: 데이터 없음</p>
@@ -288,46 +310,52 @@ export function TradeChart({
     <div className="flex w-full flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-          지표
+          우측 선
         </span>
         <div className="inline-flex rounded-lg bg-slate-100 p-0.5 ring-1 ring-slate-200/80">
           <button
             type="button"
-            onClick={() => setMetric("weight")}
+            onClick={() => setRightLine("unitPrice")}
             className={`rounded-md ${togglePad} font-medium transition-colors ${
-              metric === "weight"
+              rightLine === "unitPrice"
                 ? "bg-white text-brand-navy shadow-sm ring-1 ring-slate-200/80"
                 : "text-slate-600 hover:text-slate-900"
             }`}
           >
-            천톤 · YoY
+            {imexLabel}단가
           </button>
           <button
             type="button"
-            onClick={() => setMetric("amount")}
+            onClick={() => setRightLine("yoy")}
             className={`rounded-md ${togglePad} font-medium transition-colors ${
-              metric === "amount"
+              rightLine === "yoy"
                 ? "bg-white text-brand-navy shadow-sm ring-1 ring-slate-200/80"
                 : "text-slate-600 hover:text-slate-900"
             }`}
           >
-            금액 · YoY
+            증감률
           </button>
         </div>
+        <span className="text-xs text-slate-500">막대: 중량(천톤) 고정</span>
         {useDataZoom ? (
           <span className="text-xs text-slate-500">
             긴 구간: 아래 슬라이더·트랙패드로 이동·확대할 수 있습니다.
           </span>
         ) : null}
       </div>
-      <div className="w-full min-h-[400px] min-w-0">
-        <ReactECharts
-          option={option}
-          style={{ height: useDataZoom ? 440 : 400, width: "100%", minWidth: 0 }}
-          opts={{ renderer: "canvas", devicePixelRatio: typeof window !== "undefined" ? window.devicePixelRatio : 1 }}
-          notMerge={false}
-          lazyUpdate={false}
-        />
+      <div className="relative mx-auto w-full min-w-0 max-w-[880px] aspect-[4/3] min-h-[208px] overflow-hidden rounded-lg bg-white">
+        <div className="absolute inset-0 min-h-[208px]">
+          <ReactECharts
+            option={option}
+            style={{ height: "100%", width: "100%" }}
+            opts={{
+              renderer: "canvas",
+              devicePixelRatio: typeof window !== "undefined" ? window.devicePixelRatio : 1,
+            }}
+            notMerge={false}
+            lazyUpdate={false}
+          />
+        </div>
       </div>
     </div>
   );

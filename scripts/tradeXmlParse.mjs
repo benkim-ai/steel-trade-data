@@ -1,5 +1,9 @@
+/**
+ * 관세청 GW 품목·국가별(nitemtrade) XML → 월별 행 변환.
+ * 앱의 `src/lib/tradeXmlNormalize.ts`와 동일 로직(타입만 제거).
+ */
+
 import { XMLParser } from "fast-xml-parser";
-import type { TradeParseDebug, TradeRow } from "@/types/trade";
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -7,15 +11,12 @@ const xmlParser = new XMLParser({
   parseTagValue: true,
 });
 
-function pickString(
-  obj: Record<string, unknown>,
-  keys: string[],
-): string | undefined {
+function pickString(obj, keys) {
   for (const k of keys) {
     const v = obj[k];
     if (v === undefined || v === null) continue;
-    if (typeof v === "object" && v !== null && "#text" in (v as object)) {
-      const t = String((v as { "#text": unknown })["#text"]).trim();
+    if (typeof v === "object" && v !== null && "#text" in v) {
+      const t = String(v["#text"]).trim();
       if (t) return t;
     }
     const s = String(v).trim();
@@ -24,25 +25,21 @@ function pickString(
   return undefined;
 }
 
-function pickNumber(obj: Record<string, unknown>, keys: string[]): number {
+function pickNumber(obj, keys) {
   for (const k of keys) {
     const v = obj[k];
     if (v === undefined || v === null) continue;
-    let raw: unknown = v;
-    if (typeof v === "object" && v !== null && "#text" in (v as object)) {
-      raw = (v as { "#text": unknown })["#text"];
+    let raw = v;
+    if (typeof v === "object" && v !== null && "#text" in v) {
+      raw = v["#text"];
     }
-    const n =
-      typeof raw === "number" ? raw : Number(String(raw).replace(/,/g, ""));
+    const n = typeof raw === "number" ? raw : Number(String(raw).replace(/,/g, ""));
     if (!Number.isNaN(n)) return n;
   }
   return 0;
 }
 
-function getChildLoose(
-  obj: Record<string, unknown>,
-  name: string,
-): unknown {
+function getChildLoose(obj, name) {
   const target = name.toLowerCase();
   for (const k of Object.keys(obj)) {
     if (k.toLowerCase() === target) return obj[k];
@@ -50,29 +47,27 @@ function getChildLoose(
   return undefined;
 }
 
-function getPath(obj: unknown, path: string[]): unknown {
-  let cur: unknown = obj;
+function getPath(obj, path) {
+  let cur = obj;
   for (const p of path) {
     if (!cur || typeof cur !== "object") return undefined;
-    cur = getChildLoose(cur as Record<string, unknown>, p);
+    cur = getChildLoose(cur, p);
   }
   return cur;
 }
 
-function flattenItemValue(v: unknown): Record<string, unknown>[] {
+function flattenItemValue(v) {
   if (v === undefined || v === null) return [];
   if (Array.isArray(v)) {
-    return v.filter(
-      (x) => x && typeof x === "object" && !Array.isArray(x),
-    ) as Record<string, unknown>[];
+    return v.filter((x) => x && typeof x === "object" && !Array.isArray(x));
   }
   if (typeof v === "object" && !Array.isArray(v)) {
-    return [v as Record<string, unknown>];
+    return [v];
   }
   return [];
 }
 
-const ITEM_PATHS: string[][] = [
+const ITEM_PATHS = [
   ["response", "body", "items", "item"],
   ["Response", "Body", "Items", "Item"],
   ["response", "body", "item"],
@@ -93,9 +88,7 @@ const ITEM_PATHS: string[][] = [
   ["continenttradeListResponse", "Body", "Items", "Item"],
 ];
 
-export function extractItemsFromParsed(
-  parsed: unknown,
-): { items: Record<string, unknown>[]; usedPath?: string } {
+function extractItemsFromParsed(parsed) {
   if (!parsed || typeof parsed !== "object") {
     return { items: [] };
   }
@@ -107,8 +100,7 @@ export function extractItemsFromParsed(
   return { items: [] };
 }
 
-/** YYYYMM 또는 YYYY-MM 등 → `YYYY-MM` */
-function normalizeMonthKey(raw: string): string | null {
+function normalizeMonthKey(raw) {
   const digits = raw.replace(/\D/g, "");
   if (digits.length >= 6) {
     const y = digits.slice(0, 4);
@@ -119,8 +111,7 @@ function normalizeMonthKey(raw: string): string | null {
   return null;
 }
 
-/** 품목·국가별 API `year` 필드: "2016.01" → "2016-01" */
-function monthFromYearDotField(item: Record<string, unknown>): string | null {
+function monthFromYearDotField(item) {
   const y = pickString(item, ["year", "Year"]);
   if (!y) return null;
   const m = y.match(/^(\d{4})\.(\d{2})/);
@@ -130,7 +121,7 @@ function monthFromYearDotField(item: Record<string, unknown>): string | null {
   return `${m[1]}-${m[2]}`;
 }
 
-function monthFromItem(item: Record<string, unknown>): string | null {
+function monthFromItem(item) {
   const fromYearDot = monthFromYearDotField(item);
   if (fromYearDot) return fromYearDot;
 
@@ -152,14 +143,7 @@ function monthFromItem(item: Record<string, unknown>): string | null {
     const m = normalizeMonthKey(combined);
     if (m) return m;
   }
-  const yy = pickString(item, [
-    "statsYy",
-    "yr",
-    "yy",
-    "imyy",
-    "baseYy",
-    "chkYy",
-  ]);
+  const yy = pickString(item, ["statsYy", "yr", "yy", "imyy", "baseYy", "chkYy"]);
   const mm = pickString(item, ["statsMm", "mm", "month", "immm", "chkMm"]);
   if (yy && mm && /^\d{4}$/.test(yy)) {
     const m2 = mm.replace(/\D/g, "").slice(0, 2).padStart(2, "0");
@@ -169,21 +153,14 @@ function monthFromItem(item: Record<string, unknown>): string | null {
   return null;
 }
 
-export type TradeXmlDirection = "import" | "export";
+const KG_PER_KILOTON = 1_000_000;
 
-/** 1천톤 = 100만 kg — XML 필드는 kg, `TradeRow.weight`는 천톤으로 저장 */
-export const KG_PER_KILOTON = 1_000_000;
-
-function weightKgToKiloton(kg: number): number {
+function weightKgToKiloton(kg) {
   if (!Number.isFinite(kg)) return 0;
   return Math.round((kg / KG_PER_KILOTON) * 1_000_000) / 1_000_000;
 }
 
-/** 공공포털 XML `item` → 월별 중량(천톤)·금액(USD 원 → 백만 USD) */
-export function itemRecordToTradeRow(
-  item: Record<string, unknown>,
-  tradeDirection?: TradeXmlDirection,
-): TradeRow | null {
+export function itemRecordToTradeRow(item, tradeDirection) {
   if (tradeDirection === "export" || tradeDirection === "import") {
     const month = monthFromYearDotField(item) ?? monthFromItem(item);
     if (!month) return null;
@@ -242,11 +219,8 @@ export function itemRecordToTradeRow(
   };
 }
 
-export function normalizeItemsToRows(
-  items: Record<string, unknown>[],
-  tradeDirection?: TradeXmlDirection,
-): TradeRow[] {
-  const rows: TradeRow[] = [];
+function normalizeItemsToRows(items, tradeDirection) {
+  const rows = [];
   for (const it of items) {
     const row = itemRecordToTradeRow(it, tradeDirection);
     if (row) rows.push(row);
@@ -254,9 +228,8 @@ export function normalizeItemsToRows(
   return rows;
 }
 
-/** 동일 월 중복 시 중량(천톤)·금액 합산 후 월순 정렬 */
-export function mergeRowsByMonth(rows: TradeRow[]): TradeRow[] {
-  const map = new Map<string, { weight: number; amount: number }>();
+export function mergeRowsByMonth(rows) {
+  const map = new Map();
   for (const r of rows) {
     const cur = map.get(r.month) ?? { weight: 0, amount: 0 };
     cur.weight += r.weight;
@@ -272,14 +245,11 @@ export function mergeRowsByMonth(rows: TradeRow[]): TradeRow[] {
     }));
 }
 
-function extractStandardHeader(parsed: unknown): {
-  code?: string;
-  msg?: string;
-} {
+function extractStandardHeader(parsed) {
   if (!parsed || typeof parsed !== "object") return {};
-  const root = parsed as Record<string, unknown>;
-  const response = (root.response as Record<string, unknown>) ?? root;
-  const header = response.header as Record<string, unknown> | undefined;
+  const root = parsed;
+  const response = root.response ?? root;
+  const header = response.header;
   if (!header) return {};
   return {
     code: pickString(header, ["resultCode", "resultcode"]),
@@ -287,19 +257,12 @@ function extractStandardHeader(parsed: unknown): {
   };
 }
 
-function extractOpenApiError(parsed: unknown): {
-  reason?: string;
-  msg?: string;
-} {
+function extractOpenApiError(parsed) {
   if (!parsed || typeof parsed !== "object") return {};
-  const root = parsed as Record<string, unknown>;
-  const wrap =
-    (root.OpenAPI_ServiceResponse as Record<string, unknown>) ??
-    (root.openapi_service_response as Record<string, unknown>);
+  const root = parsed;
+  const wrap = root.OpenAPI_ServiceResponse ?? root.openapi_service_response;
   if (!wrap) return {};
-  const h =
-    (wrap.cmmMsgHeader as Record<string, unknown>) ??
-    (wrap.CmmMsgHeader as Record<string, unknown>);
+  const h = wrap.cmmMsgHeader ?? wrap.CmmMsgHeader;
   if (!h) return {};
   return {
     reason: pickString(h, ["returnReasonCode", "ReturnReasonCode"]),
@@ -307,14 +270,10 @@ function extractOpenApiError(parsed: unknown): {
   };
 }
 
-export function parseTradeXmlToRows(
-  text: string,
-  httpStatus: number,
-  options?: { tradeDirection?: TradeXmlDirection },
-): { rows: TradeRow[]; debug: TradeParseDebug } {
+export function parseTradeXmlToRows(text, httpStatus, options = {}) {
   const rawXmlPreview = text.replace(/^\uFEFF/, "").substring(0, 500);
 
-  let parsed: unknown;
+  let parsed;
   try {
     parsed = xmlParser.parse(text.replace(/^\uFEFF/, ""));
   } catch {
@@ -334,13 +293,11 @@ export function parseTradeXmlToRows(
   const oa = extractOpenApiError(parsed);
   const { items, usedPath } = extractItemsFromParsed(parsed);
   const normalized = mergeRowsByMonth(
-    normalizeItemsToRows(items, options?.tradeDirection),
+    normalizeItemsToRows(items, options.tradeDirection),
   );
 
   const firstItemKeys =
-    items[0] && typeof items[0] === "object"
-      ? Object.keys(items[0] as object).slice(0, 40)
-      : undefined;
+    items[0] && typeof items[0] === "object" ? Object.keys(items[0]).slice(0, 40) : undefined;
 
   return {
     rows: normalized,
