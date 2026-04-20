@@ -206,9 +206,9 @@ data_agent = Agent(
 
 research_agent = Agent(
     role="Korean Market Research Analyst",
-    goal="보유 종목별 최신 뉴스/시세 분석 및 모멘텀/리스크 도출. 각 종목을 하나씩 순서대로 검색하세요.",
+    goal="보유 종목별 최신 뉴스/시세 분석 및 모멘텀/리스크 도출. 모든 종목을 빠르게 병렬로 검색하세요.",
     backstory="""국내 증시 전문 애널리스트로 데이터 기반 인사이트와 명확한 모멘텀/리스크 분류에 강하며, 증권사 리포트를 매일 분석합니다.
-검색 시 종목을 하나씩 순서대로 검색하세요. 동시에 여러 종목을 검색하지 마세요.""",
+네이버 검색 API는 Rate Limit이 넉넉하므로 모든 종목을 동시에 병렬로 검색해도 됩니다. 속도를 최우선으로 하세요.""",
     tools=[search_stock_context],
     llm=llm
 )
@@ -240,10 +240,11 @@ task_data = Task(
 
 task_research = Task(
     description="""각 보유 종목의 최신 뉴스/시세/증권사 의견을 조사하세요.
-중요: 종목을 하나씩 순서대로 검색하세요. 동시에 여러 종목을 검색하면 안 됩니다.
+모든 종목을 병렬로 빠르게 검색하세요. 속도가 중요합니다.
 출력 형식: '종목명(코드): 뉴스요약 | 모멘텀 | 리스크'""",
     expected_output="종목별 컨텍스트 요약",
-    agent=research_agent
+    agent=research_agent,
+    async_execution=True
 )
 
 task_write = Task(
