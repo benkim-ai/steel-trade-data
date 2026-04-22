@@ -48,13 +48,16 @@ type FilterSnapshot = {
 
 type AppliedQuery = FilterSnapshot;
 
-const DEFAULT_COUNTRY: CustomsCountryId = CUSTOMS_COUNTRY_OPTIONS.some(
-  (o) => o.id === "US",
-)
-  ? "US"
-  : CUSTOMS_COUNTRY_OPTIONS[0]!.id;
-
 const DEFAULT_CONTINENT: CustomsContinentCode = 10;
+
+function getDefaultRecentYearRange(): { startMonth: string; endMonth: string } {
+  const today = new Date();
+  const end = new Date(today.getFullYear(), today.getMonth(), 1);
+  const start = new Date(end.getFullYear(), end.getMonth() - 11, 1);
+  const toYm = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  return { startMonth: toYm(start), endMonth: toYm(end) };
+}
 
 /** `YYYY-MM` 기준으로 `delta`개월 이동 */
 function addCalendarMonthsYm(ym: string, delta: number): string {
@@ -216,25 +219,28 @@ type DashboardProps = {
 };
 
 export function Dashboard({ tradeDirection }: DashboardProps) {
-  const defaultProduct = HS_PRODUCT_KEYS.includes("중후판")
-    ? "중후판"
+  const { startMonth: defaultStartMonth, endMonth: defaultEndMonth } =
+    getDefaultRecentYearRange();
+  const defaultProduct = HS_PRODUCT_KEYS.includes("철강재")
+    ? "철강재"
     : (HS_PRODUCT_KEYS[0] ?? "");
 
   const [regionTab, setRegionTab] = useState<RegionScopeTab>("country");
-  const [countryId, setCountryId] = useState<CountryChoiceId>(DEFAULT_COUNTRY);
+  const [countryId, setCountryId] = useState<CountryChoiceId>(COUNTRY_FILTER_ALL);
   const [continentCode, setContinentCode] =
     useState<CustomsContinentCode>(DEFAULT_CONTINENT);
   const [countryQuery, setCountryQuery] = useState("");
-  const [startMonth, setStartMonth] = useState("2020-01");
-  const [endMonth, setEndMonth] = useState("2023-05");
+  const [startMonth, setStartMonth] = useState(defaultStartMonth);
+  const [endMonth, setEndMonth] = useState(defaultEndMonth);
   const [productKey, setProductKey] = useState(defaultProduct);
+  const [hasSearched, setHasSearched] = useState(false);
 
   const [applied, setApplied] = useState<AppliedQuery>(() => ({
     regionTab: "country",
-    countryId: DEFAULT_COUNTRY,
+    countryId: COUNTRY_FILTER_ALL,
     continentCode: DEFAULT_CONTINENT,
-    startMonth: "2020-01",
-    endMonth: "2023-05",
+    startMonth: defaultStartMonth,
+    endMonth: defaultEndMonth,
     productKey: defaultProduct,
   }));
 
@@ -244,9 +250,9 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
 
   const snapRef = useRef<FilterSnapshot>({
     regionTab: "country",
-    startMonth: "2020-01",
-    endMonth: "2023-05",
-    countryId: DEFAULT_COUNTRY,
+    startMonth: defaultStartMonth,
+    endMonth: defaultEndMonth,
+    countryId: COUNTRY_FILTER_ALL,
     continentCode: DEFAULT_CONTINENT,
     productKey: defaultProduct,
   });
@@ -335,10 +341,6 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
     [tradeDirection],
   );
 
-  useEffect(() => {
-    void loadTrade(snapRef.current);
-  }, [tradeDirection, loadTrade, regionTab]);
-
   const handleSearch = useCallback(() => {
     const { start, end } = normalizeMonthRange(startMonth, endMonth);
     if (start !== startMonth || end !== endMonth) {
@@ -353,6 +355,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
       endMonth: end,
       productKey,
     });
+    setHasSearched(true);
     void loadTrade({
       regionTab,
       countryId,
@@ -422,6 +425,15 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
   const chartMonths = filteredRows.map((r) => r.month);
   const chartWeights = filteredRows.map((r) => r.weight);
   const chartAmounts = filteredRows.map((r) => r.amount);
+  const displayProductKeys = useMemo(() => {
+    const keys = [...HS_PRODUCT_KEYS];
+    const steelIdx = keys.indexOf("철강재");
+    const plateIdx = keys.indexOf("중후판");
+    if (steelIdx >= 0 && plateIdx >= 0) {
+      [keys[steelIdx], keys[plateIdx]] = [keys[plateIdx], keys[steelIdx]];
+    }
+    return keys;
+  }, []);
 
   const chartKey = useMemo(
     () =>
@@ -494,7 +506,14 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
               </p>
             </div>
 
-            {!loading && filteredRows.length === 0 ? (
+            {!hasSearched ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50/80 py-24 text-center">
+                <p className="text-base font-semibold text-slate-700">
+                  데이터 조회 조건을 설정해주세요
+                </p>
+              </div>
+            ) : null}
+            {!loading && hasSearched && filteredRows.length === 0 ? (
               <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50/80 py-24 text-center">
                 <p className="text-base font-semibold text-slate-700">데이터 없음</p>
                 <p className="max-w-md text-sm text-slate-500">
@@ -511,7 +530,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                 데이터를 불러오는 중입니다.
               </div>
             ) : null}
-            {!loading && filteredRows.length > 0 ? (
+            {!loading && hasSearched && filteredRows.length > 0 ? (
               <TradeChart
                 key={chartKey}
                 categories={chartCategories}
@@ -598,7 +617,12 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                 </tbody>
               </table>
             </div>
-            {filteredRows.length === 0 && !loading ? (
+            {!hasSearched ? (
+              <p className="mt-3 text-center text-sm text-slate-500">
+                데이터 조회 조건을 설정해주세요
+              </p>
+            ) : null}
+            {hasSearched && filteredRows.length === 0 && !loading ? (
               <p className="mt-3 text-center text-sm text-slate-500">
                 기간을 조정하거나 TRADE_API_KEY·API 파라미터를 확인해 주세요.
               </p>
@@ -751,7 +775,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
               선택한 품목의 HS 코드 전체를 서버에서 병렬 조회·월별 합산합니다.
             </p>
             <div className="max-h-[min(36vh,280px)] space-y-1 overflow-y-auto rounded-xl bg-slate-50 p-2 ring-1 ring-slate-100">
-              {HS_PRODUCT_KEYS.map((key) => (
+              {displayProductKeys.map((key) => (
                 <label
                   key={key}
                   className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors ${

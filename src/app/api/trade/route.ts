@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import { TRADE_API_URLS } from "@/constants/apiEndpoints";
-import { CUSTOMS_COUNTRY_OPTIONS } from "@/constants/customsCountryCodes";
+import { getCountryIdsByContinentCode } from "@/constants/continentCountryMap";
 import { HS_CODE_MAP } from "@/constants/hsCodes";
 import { COUNTRY_FILTER_ALL } from "@/constants/mappings";
 import { mergeRowsByMonth, parseTradeXmlToRows } from "@/lib/tradeXmlNormalize";
@@ -143,8 +143,7 @@ function buildNitemtradeUrl(
   return `${base}?serviceKey=${serviceKey}&strtYymm=${parts.normalizedStart}&endYymm=${parts.normalizedEnd}&pageNo=${parts.pageNo}&numOfRows=${parts.numOfRows}&cntyCd=${parts.cntyCd}&hsSgn=${parts.hsSgn}`;
 }
 
-/** 대륙별 + 품목(HS) — GW `imexTpcd`·`cntnEbkUnfcClsfCd`·`hsSgn` */
-function buildContinentTradeUrl(
+function buildItemtradeUrl(
   serviceKey: string,
   parts: {
     normalizedStart: string;
@@ -152,12 +151,11 @@ function buildContinentTradeUrl(
     pageNo: string;
     numOfRows: string;
     imexTpcd: string;
-    cntnEbkUnfcClsfCd: string;
     hsSgn: string;
   },
 ): string {
-  const base = TRADE_API_URLS.continent;
-  return `${base}?serviceKey=${serviceKey}&strtYymm=${parts.normalizedStart}&endYymm=${parts.normalizedEnd}&pageNo=${parts.pageNo}&numOfRows=${parts.numOfRows}&imexTpcd=${parts.imexTpcd}&cntnEbkUnfcClsfCd=${parts.cntnEbkUnfcClsfCd}&hsSgn=${parts.hsSgn}`;
+  const base = TRADE_API_URLS.itemtrade;
+  return `${base}?serviceKey=${serviceKey}&strtYymm=${parts.normalizedStart}&endYymm=${parts.normalizedEnd}&pageNo=${parts.pageNo}&numOfRows=${parts.numOfRows}&imexTpcd=${parts.imexTpcd}&hsSgn=${parts.hsSgn}`;
 }
 
 /** 수출입총괄 — `strtYymm`/`endYymm`(6자리 YYYYMM)으로 상류 호출 */
@@ -194,6 +192,17 @@ async function handleOverall(
 
 type NitemtradeSettled = { rows: TradeRow[]; debug: TradeParseDebug };
 
+function parseTradeXmlWithFallback(
+  text: string,
+  status: number,
+  tradeDirection: TradeXmlDirection,
+): { rows: TradeRow[]; debug: TradeParseDebug } {
+  const preferred = parseTradeXmlToRows(text, status, { tradeDirection });
+  if (preferred.rows.length > 0) return preferred;
+  const fallback = parseTradeXmlToRows(text, status);
+  return fallback.rows.length > 0 ? fallback : preferred;
+}
+
 /** 단일 cntyCd에 대해 기간·HS 구간별 GW 품목·국가별 호출 후 월별 합산된 행 */
 async function runNitemtradeForCountry(
   cntyCd: string,
@@ -203,7 +212,6 @@ async function runNitemtradeForCountry(
   hsList: string[],
   windows: { start: string; end: string }[],
 ): Promise<{ rows: TradeRow[]; settled: NitemtradeSettled[] }> {
-  const parseOpts = { tradeDirection };
   const allSettled: NitemtradeSettled[] = [];
 
   for (const w of windows) {
@@ -220,7 +228,7 @@ async function runNitemtradeForCountry(
         try {
           const { text, status } = await fetchUpstreamXml(url);
           if (status >= 400) {
-            const { debug } = parseTradeXmlToRows(text, status, parseOpts);
+            const { debug } = parseTradeXmlWithFallback(text, status, tradeDirection);
             return {
               rows: [] as TradeRow[],
               debug: {
@@ -229,12 +237,65 @@ async function runNitemtradeForCountry(
               },
             };
           }
-          return parseTradeXmlToRows(text, status, parseOpts);
+          return parseTradeXmlWithFallback(text, status, tradeDirection);
         } catch (e) {
           return {
             rows: [] as TradeRow[],
             debug: emptyFetchDebug(
               `품목·국가별 예외 (cntyCd=${cntyCd}, hsSgn=${hsSgn}, ${w.start}~${w.end}): ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            ),
+          };
+        }
+      }),
+    );
+    allSettled.push(...settled);
+  }
+
+  const merged = mergeRowsByMonth(allSettled.flatMap((s) => s.rows));
+  return { rows: merged, settled: allSettled };
+}
+
+async function runItemtradeForAllCountries(
+  serviceKey: string,
+  tradeDirection: TradeXmlDirection,
+  common: NonNullable<ReturnType<typeof buildCommonParams>>,
+  hsList: string[],
+  windows: { start: string; end: string }[],
+): Promise<{ rows: TradeRow[]; settled: NitemtradeSettled[] }> {
+  const imexTpcd = tradeDirection === "import" ? "2" : "1";
+  const allSettled: NitemtradeSettled[] = [];
+
+  for (const w of windows) {
+    const settled = await Promise.all(
+      hsList.map(async (hsSgn) => {
+        const url = buildItemtradeUrl(serviceKey, {
+          normalizedStart: w.start,
+          normalizedEnd: w.end,
+          pageNo: common.pageNo,
+          numOfRows: common.numOfRows,
+          imexTpcd,
+          hsSgn,
+        });
+        try {
+          const { text, status } = await fetchUpstreamXml(url);
+          if (status >= 400) {
+            const { debug } = parseTradeXmlWithFallback(text, status, tradeDirection);
+            return {
+              rows: [] as TradeRow[],
+              debug: {
+                ...debug,
+                resultMsg: `${debug.resultMsg ?? ""} upstream HTTP ${status} (hsSgn=${hsSgn}, ${w.start}~${w.end})`.trim(),
+              },
+            };
+          }
+          return parseTradeXmlWithFallback(text, status, tradeDirection);
+        } catch (e) {
+          return {
+            rows: [] as TradeRow[],
+            debug: emptyFetchDebug(
+              `품목별 합계 API 예외 (hsSgn=${hsSgn}, ${w.start}~${w.end}): ${
                 e instanceof Error ? e.message : String(e)
               }`,
             ),
@@ -317,22 +378,15 @@ async function handleNitemtrade(
   let allSettled: NitemtradeSettled[];
 
   if (countryId === COUNTRY_FILTER_ALL) {
-    const countryCodes = CUSTOMS_COUNTRY_OPTIONS.map((o) => o.id);
-    const perCountryRows: TradeRow[] = [];
-    allSettled = [];
-    for (let i = 0; i < countryCodes.length; i += NITEMTRADE_ALL_COUNTRIES_PARALLEL) {
-      const batch = countryCodes.slice(i, i + NITEMTRADE_ALL_COUNTRIES_PARALLEL);
-      const results = await Promise.all(
-        batch.map((cc) =>
-          runNitemtradeForCountry(cc, serviceKey, tradeDirection, common, hsList, windows),
-        ),
-      );
-      for (const r of results) {
-        perCountryRows.push(...r.rows);
-        allSettled.push(...r.settled);
-      }
-    }
-    merged = mergeRowsByMonth(perCountryRows);
+    const all = await runItemtradeForAllCountries(
+      serviceKey,
+      tradeDirection,
+      common,
+      hsList,
+      windows,
+    );
+    merged = all.rows;
+    allSettled = all.settled;
   } else {
     const one = await runNitemtradeForCountry(
       countryId,
@@ -367,7 +421,7 @@ async function handleNitemtrade(
         ? "품목·국가별 API 응답 파싱 결과 비어 있음 — 필드명·키·기간을 확인하세요."
         : [
             isAllCountries
-              ? `전체 합계: 관세청 국가코드 ${CUSTOMS_COUNTRY_OPTIONS.length}개국 × HS 병렬 조회 후 월별 합산했습니다. 완료까지 시간이 걸릴 수 있습니다.`
+              ? "전체 합계: 품목별 수출입실적(GW, 15101609) API를 사용해 HS 기준 월별 합계를 조회했습니다."
               : null,
             someFailed && anySuccess
               ? "일부 HS·기간·국가 요청은 실패했으나, 성공한 구간만 합산했습니다."
@@ -440,57 +494,38 @@ async function handleContinentProduct(
     };
   }
 
-  const imexTpcd = tradeDirection === "import" ? "2" : "1";
-
   const windows = splitYymmRangeInclusive(
     common.normalizedStart,
     common.normalizedEnd,
     API_YXMM_CHUNK_MONTHS,
   );
 
-  const allSettled: { rows: TradeRow[]; debug: TradeParseDebug }[] = [];
-
-  for (const w of windows) {
-    const settled = await Promise.all(
-      hsList.map(async (hsSgn) => {
-        const url = buildContinentTradeUrl(serviceKey, {
-          normalizedStart: w.start,
-          normalizedEnd: w.end,
-          pageNo: common.pageNo,
-          numOfRows: common.numOfRows,
-          imexTpcd,
-          cntnEbkUnfcClsfCd: continentCode,
-          hsSgn,
-        });
-        try {
-          const { text, status } = await fetchUpstreamXml(url);
-          if (status >= 400) {
-            const { debug } = parseTradeXmlToRows(text, status);
-            return {
-              rows: [] as TradeRow[],
-              debug: {
-                ...debug,
-                resultMsg: `${debug.resultMsg ?? ""} upstream HTTP ${status} (hsSgn=${hsSgn}, ${w.start}~${w.end})`.trim(),
-              },
-            };
-          }
-          return parseTradeXmlToRows(text, status);
-        } catch (e) {
-          return {
-            rows: [] as TradeRow[],
-            debug: emptyFetchDebug(
-              `대륙별 예외 (hsSgn=${hsSgn}, ${w.start}~${w.end}): ${
-                e instanceof Error ? e.message : String(e)
-              }`,
-            ),
-          };
-        }
-      }),
-    );
-    allSettled.push(...settled);
+  const countryCodes = getCountryIdsByContinentCode(continentCode);
+  if (countryCodes.length === 0) {
+    return {
+      ok: false,
+      rows: [],
+      apiType: "continent",
+      error: `대륙코드 ${continentCode}에 매핑된 국가가 없습니다.`,
+    };
   }
 
-  const merged = mergeRowsByMonth(allSettled.flatMap((s) => s.rows));
+  const perCountryRows: TradeRow[] = [];
+  const allSettled: NitemtradeSettled[] = [];
+  for (let i = 0; i < countryCodes.length; i += NITEMTRADE_ALL_COUNTRIES_PARALLEL) {
+    const batch = countryCodes.slice(i, i + NITEMTRADE_ALL_COUNTRIES_PARALLEL);
+    const results = await Promise.all(
+      batch.map((cc) =>
+        runNitemtradeForCountry(cc, serviceKey, tradeDirection, common, hsList, windows),
+      ),
+    );
+    for (const r of results) {
+      perCountryRows.push(...r.rows);
+      allSettled.push(...r.settled);
+    }
+  }
+
+  const merged = mergeRowsByMonth(perCountryRows);
   const debugWhenEmpty =
     merged.length === 0
       ? (allSettled
@@ -513,6 +548,7 @@ async function handleContinentProduct(
             someFailed && anySuccess
               ? "일부 HS·기간 구간 요청은 실패했으나, 성공한 구간만 합산했습니다."
               : null,
+            `대륙코드 ${continentCode} 매핑 국가 ${countryCodes.length}개를 국가별 API로 조회 후 월별 합산했습니다.`,
             chunked
               ? `조회 기간을 ${API_YXMM_CHUNK_MONTHS}개월 단위로 나누어 호출한 뒤 월별로 합쳤습니다.`
               : null,

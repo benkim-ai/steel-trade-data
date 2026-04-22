@@ -6,6 +6,8 @@
 export const TRADE_API_DATASET_IDS = {
   /** 수출입총괄 */
   admst: "15102108",
+  /** 품목별 수출입실적(GW) */
+  itemtrade: "15101609",
 } as const;
 
 /** GW(게이트웨이) 실제 호출 URL — 소문자 `itmtrade`/`cntrytrade` 등은 500·Unexpected errors 유발 */
@@ -14,6 +16,8 @@ export const TRADE_API_URLS = {
   overall: "https://apis.data.go.kr/1220000/admst/getAdmstList",
   /** 관세청_품목별 국가별 수출입실적(GW) */
   nitemtrade: "https://apis.data.go.kr/1220000/nitemtrade/getNitemtradeList",
+  /** 관세청_품목별 수출입실적(GW) */
+  itemtrade: "https://apis.data.go.kr/1220000/Itemtrade/getItemtradeList",
   /**
    * 관세청_대륙별 수출입실적(GW) — Base `/1220000/continenttradet` (끝 `t`)
    * 조회코드 엑셀: cntnEbkUnfcClsfCd = 대륙경제권통합분류코드
