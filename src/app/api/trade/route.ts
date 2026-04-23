@@ -1,8 +1,13 @@
 export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 import { TRADE_API_URLS } from "@/constants/apiEndpoints";
-import { getCountryIdsByContinentCode } from "@/constants/continentCountryMap";
+import {
+  mapContinentCodeToRegionName,
+  mapUiProductToKosaItemName,
+} from "@/constants/continentQueryMappings";
+import { CUSTOMS_COUNTRY_OPTIONS } from "@/constants/customsCountryCodes";
 import { HS_CODE_MAP } from "@/constants/hsCodes";
 import { COUNTRY_FILTER_ALL } from "@/constants/mappings";
 import { mergeRowsByMonth, parseTradeXmlToRows } from "@/lib/tradeXmlNormalize";
@@ -18,6 +23,15 @@ import type {
 function getServiceKey(): string | null {
   const k = process.env.TRADE_API_KEY?.trim();
   return k || null;
+}
+
+function getSupabaseServerClient() {
+  const supabaseUrl = process.env.SUPABASE_URL?.trim();
+  const serviceKey = process.env.SUPABASE_SERVICE_KEY?.trim();
+  if (!supabaseUrl || !serviceKey) return null;
+  return createClient(supabaseUrl, serviceKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
 }
 
 /** YYYYMMDD 등에서 앞 6자리 YYYYMM 추출 */
@@ -37,6 +51,10 @@ function normalizeYymmParam(raw: string | null): string | null {
   const mm = Number(yymm.slice(4, 6));
   if (mm < 1 || mm > 12) return null;
   return yymm;
+}
+
+function yymmToMonthStartDate(yymm: string): string {
+  return `${yymm.slice(0, 4)}-${yymm.slice(4, 6)}-01`;
 }
 
 function maskServiceKeyInUrl(url: string): string {
@@ -75,6 +93,9 @@ function emptyFetchDebug(msg: string): TradeParseDebug {
 const DEFAULT_PAGE_NO = "1";
 /** 월별 행 위주 응답에 맞춘 상한(한 창 기준) */
 const DEFAULT_NUM_OF_ROWS = "999";
+const STEEL_COUNTRY_TABLE =
+  process.env.KOSA_STEEL_COUNTRY_TABLE?.trim() || "kosa_steel_country_data";
+const STEEL_COUNTRY_SUPABASE_END_YYMM = "202512";
 
 /** 관세청 GW가 한 번에 긴 기간을 잘라 주는 경우가 있어, 최대 이 개월 단위로 나눠 호출 후 합산 */
 const API_YXMM_CHUNK_MONTHS = 12;
@@ -191,6 +212,10 @@ async function handleOverall(
 }
 
 type NitemtradeSettled = { rows: TradeRow[]; debug: TradeParseDebug };
+type NitemtradeAttempt = NitemtradeSettled & {
+  ok: boolean;
+  requestLabel: string;
+};
 
 function parseTradeXmlWithFallback(
   text: string,
@@ -203,6 +228,92 @@ function parseTradeXmlWithFallback(
   return fallback.rows.length > 0 ? fallback : preferred;
 }
 
+const HS_FETCH_CONCURRENCY = 8;
+const HS_FETCH_MAX_ATTEMPTS = 4;
+const HS_FETCH_RETRY_BASE_MS = 400;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryUpstreamStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+async function runWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    const chunk = items.slice(i, i + concurrency);
+    const chunkResults = await Promise.all(chunk.map(worker));
+    out.push(...chunkResults);
+  }
+  return out;
+}
+
+async function fetchTradeAttemptWithRetry(
+  requestLabel: string,
+  tradeDirection: TradeXmlDirection,
+  buildUrl: () => string,
+): Promise<NitemtradeAttempt> {
+  let lastFailure: NitemtradeAttempt | null = null;
+
+  for (let attempt = 1; attempt <= HS_FETCH_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const { text, status } = await fetchUpstreamXml(buildUrl());
+      if (status < 400) {
+        const parsed = parseTradeXmlWithFallback(text, status, tradeDirection);
+        return {
+          ...parsed,
+          ok: true,
+          requestLabel,
+        };
+      }
+
+      const parsed = parseTradeXmlWithFallback(text, status, tradeDirection);
+      lastFailure = {
+        rows: [],
+        debug: {
+          ...parsed.debug,
+          resultMsg: `${parsed.debug.resultMsg ?? ""} upstream HTTP ${status} (${requestLabel}, attempt ${attempt}/${HS_FETCH_MAX_ATTEMPTS})`.trim(),
+        },
+        ok: false,
+        requestLabel,
+      };
+
+      if (!shouldRetryUpstreamStatus(status) || attempt === HS_FETCH_MAX_ATTEMPTS) {
+        return lastFailure;
+      }
+    } catch (e) {
+      lastFailure = {
+        rows: [],
+        debug: emptyFetchDebug(
+          `${requestLabel} 예외 (attempt ${attempt}/${HS_FETCH_MAX_ATTEMPTS}): ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        ),
+        ok: false,
+        requestLabel,
+      };
+      if (attempt === HS_FETCH_MAX_ATTEMPTS) return lastFailure;
+    }
+
+    await sleep(HS_FETCH_RETRY_BASE_MS * 2 ** (attempt - 1));
+  }
+
+  return (
+    lastFailure ?? {
+      rows: [],
+      debug: emptyFetchDebug(`${requestLabel} 알 수 없는 실패`),
+      ok: false,
+      requestLabel,
+    }
+  );
+}
+
 /** 단일 cntyCd에 대해 기간·HS 구간별 GW 품목·국가별 호출 후 월별 합산된 행 */
 async function runNitemtradeForCountry(
   cntyCd: string,
@@ -211,49 +322,32 @@ async function runNitemtradeForCountry(
   common: NonNullable<ReturnType<typeof buildCommonParams>>,
   hsList: string[],
   windows: { start: string; end: string }[],
-): Promise<{ rows: TradeRow[]; settled: NitemtradeSettled[] }> {
-  const allSettled: NitemtradeSettled[] = [];
+): Promise<{ rows: TradeRow[]; settled: NitemtradeAttempt[] }> {
+  const allSettled: NitemtradeAttempt[] = [];
 
   for (const w of windows) {
-    const settled = await Promise.all(
-      hsList.map(async (hsSgn) => {
-        const url = buildNitemtradeUrl(serviceKey, {
-          normalizedStart: w.start,
-          normalizedEnd: w.end,
-          pageNo: common.pageNo,
-          numOfRows: common.numOfRows,
-          cntyCd,
-          hsSgn,
-        });
-        try {
-          const { text, status } = await fetchUpstreamXml(url);
-          if (status >= 400) {
-            const { debug } = parseTradeXmlWithFallback(text, status, tradeDirection);
-            return {
-              rows: [] as TradeRow[],
-              debug: {
-                ...debug,
-                resultMsg: `${debug.resultMsg ?? ""} upstream HTTP ${status} (cntyCd=${cntyCd}, hsSgn=${hsSgn}, ${w.start}~${w.end})`.trim(),
-              },
-            };
-          }
-          return parseTradeXmlWithFallback(text, status, tradeDirection);
-        } catch (e) {
-          return {
-            rows: [] as TradeRow[],
-            debug: emptyFetchDebug(
-              `품목·국가별 예외 (cntyCd=${cntyCd}, hsSgn=${hsSgn}, ${w.start}~${w.end}): ${
-                e instanceof Error ? e.message : String(e)
-              }`,
-            ),
-          };
-        }
-      }),
+    const settled = await runWithConcurrency(
+      hsList,
+      HS_FETCH_CONCURRENCY,
+      async (hsSgn) =>
+        fetchTradeAttemptWithRetry(
+          `품목·국가별 cntyCd=${cntyCd}, hsSgn=${hsSgn}, ${w.start}~${w.end}`,
+          tradeDirection,
+          () =>
+            buildNitemtradeUrl(serviceKey, {
+              normalizedStart: w.start,
+              normalizedEnd: w.end,
+              pageNo: common.pageNo,
+              numOfRows: common.numOfRows,
+              cntyCd,
+              hsSgn,
+            }),
+        ),
     );
     allSettled.push(...settled);
   }
 
-  const merged = mergeRowsByMonth(allSettled.flatMap((s) => s.rows));
+  const merged = mergeRowsByMonth(allSettled.filter((s) => s.ok).flatMap((s) => s.rows));
   return { rows: merged, settled: allSettled };
 }
 
@@ -263,55 +357,99 @@ async function runItemtradeForAllCountries(
   common: NonNullable<ReturnType<typeof buildCommonParams>>,
   hsList: string[],
   windows: { start: string; end: string }[],
-): Promise<{ rows: TradeRow[]; settled: NitemtradeSettled[] }> {
+): Promise<{ rows: TradeRow[]; settled: NitemtradeAttempt[] }> {
   const imexTpcd = tradeDirection === "import" ? "2" : "1";
-  const allSettled: NitemtradeSettled[] = [];
+  const allSettled: NitemtradeAttempt[] = [];
 
   for (const w of windows) {
-    const settled = await Promise.all(
-      hsList.map(async (hsSgn) => {
-        const url = buildItemtradeUrl(serviceKey, {
-          normalizedStart: w.start,
-          normalizedEnd: w.end,
-          pageNo: common.pageNo,
-          numOfRows: common.numOfRows,
-          imexTpcd,
-          hsSgn,
-        });
-        try {
-          const { text, status } = await fetchUpstreamXml(url);
-          if (status >= 400) {
-            const { debug } = parseTradeXmlWithFallback(text, status, tradeDirection);
-            return {
-              rows: [] as TradeRow[],
-              debug: {
-                ...debug,
-                resultMsg: `${debug.resultMsg ?? ""} upstream HTTP ${status} (hsSgn=${hsSgn}, ${w.start}~${w.end})`.trim(),
-              },
-            };
-          }
-          return parseTradeXmlWithFallback(text, status, tradeDirection);
-        } catch (e) {
-          return {
-            rows: [] as TradeRow[],
-            debug: emptyFetchDebug(
-              `품목별 합계 API 예외 (hsSgn=${hsSgn}, ${w.start}~${w.end}): ${
-                e instanceof Error ? e.message : String(e)
-              }`,
-            ),
-          };
-        }
-      }),
+    const settled = await runWithConcurrency(
+      hsList,
+      HS_FETCH_CONCURRENCY,
+      async (hsSgn) =>
+        fetchTradeAttemptWithRetry(
+          `품목별 합계 hsSgn=${hsSgn}, ${w.start}~${w.end}`,
+          tradeDirection,
+          () =>
+            buildItemtradeUrl(serviceKey, {
+              normalizedStart: w.start,
+              normalizedEnd: w.end,
+              pageNo: common.pageNo,
+              numOfRows: common.numOfRows,
+              imexTpcd,
+              hsSgn,
+            }),
+        ),
     );
     allSettled.push(...settled);
   }
 
-  const merged = mergeRowsByMonth(allSettled.flatMap((s) => s.rows));
+  const merged = mergeRowsByMonth(allSettled.filter((s) => s.ok).flatMap((s) => s.rows));
   return { rows: merged, settled: allSettled };
 }
 
-/** 전체 합계: 국가 단위로 소량 병렬 호출(과도한 동시 요청 방지) */
-const NITEMTRADE_ALL_COUNTRIES_PARALLEL = 4;
+async function fetchSteelCountryRowsFromSupabase(
+  tradeDirection: TradeXmlDirection,
+  countryName: string,
+  startYymm: string,
+  endYymm: string,
+): Promise<{ rows: TradeRow[]; notice?: string; error?: string }> {
+  const supabase = getSupabaseServerClient();
+  if (!supabase) {
+    return {
+      rows: [],
+      error:
+        "Supabase 환경변수(SUPABASE_URL, SUPABASE_SERVICE_KEY)가 설정되지 않았습니다.",
+    };
+  }
+
+  const { data, error } = await supabase
+    .from(STEEL_COUNTRY_TABLE)
+    .select("year_month, qty, amount")
+    .eq("flow_type", tradeDirection)
+    .eq("item_name", "철강재계")
+    .eq("country_name", countryName)
+    .gte("year_month", yymmToMonthStartDate(startYymm))
+    .lte("year_month", yymmToMonthStartDate(endYymm))
+    .order("year_month", { ascending: true });
+
+  if (error) {
+    return {
+      rows: [],
+      error: `철강재 국가별 Supabase 조회 실패: ${error.message}`,
+    };
+  }
+
+  const monthly = new Map<string, { qtyTons: number; amountUsd: number }>();
+  for (const r of data ?? []) {
+    const ym = String((r as { year_month: unknown }).year_month ?? "")
+      .replace(/\D/g, "")
+      .slice(0, 6);
+    if (!/^\d{6}$/.test(ym)) continue;
+    const month = `${ym.slice(0, 4)}-${ym.slice(4, 6)}`;
+    const qtyTons = Number((r as { qty: unknown }).qty ?? 0);
+    const amountUsd = Number((r as { amount: unknown }).amount ?? 0);
+    const cur = monthly.get(month) ?? { qtyTons: 0, amountUsd: 0 };
+    cur.qtyTons += Number.isFinite(qtyTons) ? qtyTons : 0;
+    cur.amountUsd += Number.isFinite(amountUsd) ? amountUsd : 0;
+    monthly.set(month, cur);
+  }
+
+  const rows: TradeRow[] = [...monthly.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, v]) => ({
+      month,
+      weight: Math.round((v.qtyTons / 1000) * 1_000_000) / 1_000_000,
+      amount: Math.round((v.amountUsd / 1_000_000) * 1_000_000) / 1_000_000,
+    }));
+
+  return {
+    rows,
+    notice:
+      rows.length > 0
+        ? `철강재 2025년까지는 Supabase(${STEEL_COUNTRY_TABLE})에서 조회했습니다. country_name="${countryName}"`
+        : undefined,
+  };
+}
 
 /**
  * 품목·국가별(GW) — HS_CODE_MAP[productKey] 전체를 병렬 호출 후 월별 합산.
@@ -374,8 +512,88 @@ async function handleNitemtrade(
     API_YXMM_CHUNK_MONTHS,
   );
 
+  const isSteelCountryHybrid =
+    productKey === "철강재" && countryId !== COUNTRY_FILTER_ALL;
+  if (isSteelCountryHybrid) {
+    const countryName =
+      CUSTOMS_COUNTRY_OPTIONS.find((o) => o.id === countryId)?.name ?? countryId;
+
+    const supabaseEnd =
+      common.normalizedEnd < STEEL_COUNTRY_SUPABASE_END_YYMM
+        ? common.normalizedEnd
+        : STEEL_COUNTRY_SUPABASE_END_YYMM;
+    const shouldUseSupabase = common.normalizedStart <= STEEL_COUNTRY_SUPABASE_END_YYMM;
+
+    let supabaseRows: TradeRow[] = [];
+    const notices: string[] = [];
+    if (shouldUseSupabase) {
+      const supabasePart = await fetchSteelCountryRowsFromSupabase(
+        tradeDirection,
+        countryName,
+        common.normalizedStart,
+        supabaseEnd,
+      );
+      if (supabasePart.error) {
+        return {
+          ok: false,
+          rows: [],
+          apiType: "nitemtrade",
+          error: supabasePart.error,
+        };
+      }
+      supabaseRows = supabasePart.rows;
+      if (supabasePart.notice) notices.push(supabasePart.notice);
+    }
+
+    const apiStart =
+      common.normalizedStart > STEEL_COUNTRY_SUPABASE_END_YYMM
+        ? common.normalizedStart
+        : "202601";
+
+    let apiRows: TradeRow[] = [];
+    if (common.normalizedEnd >= apiStart) {
+      const apiWindows = splitYymmRangeInclusive(
+        apiStart,
+        common.normalizedEnd,
+        API_YXMM_CHUNK_MONTHS,
+      );
+      const apiPart = await runNitemtradeForCountry(
+        countryId,
+        serviceKey,
+        tradeDirection,
+        common,
+        hsList,
+        apiWindows,
+      );
+      const failedAttempts = apiPart.settled.filter((r) => !r.ok);
+      if (failedAttempts.length > 0) {
+        const sampleFailures = failedAttempts
+          .slice(0, 3)
+          .map((r) => r.requestLabel)
+          .join(" / ");
+        return {
+          ok: false,
+          rows: [],
+          apiType: "nitemtrade",
+          error: `철강재 2026년 이후 API 요청 ${apiPart.settled.length}건 중 ${failedAttempts.length}건이 끝까지 실패했습니다. 잠시 후 다시 시도해 주세요.${sampleFailures ? ` 예시: ${sampleFailures}` : ""}`,
+        };
+      }
+      apiRows = apiPart.rows;
+      if (apiWindows.length > 0) {
+        notices.push("철강재 2026년 이후는 관세청 API에서 조회했습니다.");
+      }
+    }
+
+    return {
+      ok: true,
+      rows: mergeRowsByMonth([...supabaseRows, ...apiRows]),
+      apiType: "nitemtrade",
+      notice: notices.join(" "),
+    };
+  }
+
   let merged: TradeRow[];
-  let allSettled: NitemtradeSettled[];
+  let allSettled: NitemtradeAttempt[];
 
   if (countryId === COUNTRY_FILTER_ALL) {
     const all = await runItemtradeForAllCountries(
@@ -407,10 +625,28 @@ async function handleNitemtrade(
           .find((d) => d.extractedRawItems > 0) ?? allSettled[0]?.debug)
       : undefined;
 
-  const anySuccess = allSettled.some((r) => r.rows.length > 0);
-  const someFailed = allSettled.some((r) => r.rows.length === 0);
+  const failedAttempts = allSettled.filter((r) => !r.ok);
+  const anySuccess = allSettled.some((r) => r.ok && r.rows.length > 0);
+  const someFailed = failedAttempts.length > 0;
   const chunked = windows.length > 1;
   const isAllCountries = countryId === COUNTRY_FILTER_ALL;
+
+  if (someFailed) {
+    const sampleFailures = failedAttempts
+      .slice(0, 3)
+      .map((r) => r.requestLabel)
+      .join(" / ");
+    return {
+      ok: false,
+      rows: [],
+      apiType: "nitemtrade",
+      error: `정확한 합계를 위해 필요한 HS 요청 ${allSettled.length}건 중 ${failedAttempts.length}건이 끝까지 실패했습니다. 잠시 후 다시 시도해 주세요.${sampleFailures ? ` 예시: ${sampleFailures}` : ""}`,
+      notice: chunked
+        ? `조회 기간을 ${API_YXMM_CHUNK_MONTHS}개월 단위로 나누어 호출했습니다.`
+        : undefined,
+      ...(debugWhenEmpty ? { debug: debugWhenEmpty } : {}),
+    };
+  }
 
   return {
     ok: true,
@@ -436,17 +672,15 @@ async function handleNitemtrade(
   };
 }
 
-const VALID_CONTINENT_CODES = new Set([
-  "10", "20", "30", "40", "50", "60", "70", "80", "99",
-]);
+const KOSA_CONTINENT_TABLE = process.env.KOSA_CONTINENT_TABLE?.trim() || "kosa_trade_data";
 
 /**
- * 품목·대륙별(GW) — HS별 병렬 호출 후 월별 합산. `imexTpcd`는 수입/수출 탭에 맞춤.
- * 응답은 총괄형 필드(netWght 등)로 파싱(`tradeDirection` 미사용).
+ * 품목·대륙별(KOSA/Supabase)
+ * - flow_type(import|export), item_name, region_name, year_month 범위로 조회
+ * - qty(톤), amount(USD)을 월별 합산 후 qty는 천톤, amount는 백만USD로 변환
  */
 async function handleContinentProduct(
   sp: URLSearchParams,
-  serviceKey: string,
   tradeDirection: TradeXmlDirection,
   continentCode: string,
 ): Promise<TradeApiResponse> {
@@ -460,102 +694,88 @@ async function handleContinentProduct(
     };
   }
 
-  if (!VALID_CONTINENT_CODES.has(continentCode)) {
+  const regionName = mapContinentCodeToRegionName(continentCode);
+  if (!regionName) {
     return {
       ok: false,
       rows: [],
       apiType: "continent",
-      error: `유효하지 않은 continentCode: ${continentCode} (조회코드 엑셀 대륙코드 10~99)`,
+      error: `유효하지 않은 continentCode: ${continentCode} (허용: 10,15,20,30,40,50,60,80)`,
     };
   }
 
   const productKey = sp.get("productKey")?.trim() ?? "";
-  if (!productKey || !HS_CODE_MAP[productKey]?.length) {
+  if (!productKey) {
     return {
       ok: false,
       rows: [],
       apiType: "continent",
-      error: `유효한 productKey(HS_CODE_MAP 키)가 필요합니다. 받은 값: "${productKey}"`,
+      error: `유효한 productKey가 필요합니다. 받은 값: "${productKey}"`,
     };
   }
 
-  const hsList = [
-    ...new Set(
-      HS_CODE_MAP[productKey]!.map((c) => c.replace(/\D/g, "")).filter((c) => c.length === 10),
-    ),
-  ];
-
-  if (hsList.length === 0) {
+  const supabase = getSupabaseServerClient();
+  if (!supabase) {
     return {
       ok: false,
       rows: [],
       apiType: "continent",
-      error: "해당 품목에 유효한 10자리 HS 코드가 없습니다.",
+      error:
+        "Supabase 환경변수(SUPABASE_URL, SUPABASE_SERVICE_KEY)가 설정되지 않았습니다.",
     };
   }
 
-  const windows = splitYymmRangeInclusive(
-    common.normalizedStart,
-    common.normalizedEnd,
-    API_YXMM_CHUNK_MONTHS,
-  );
+  const mappedItemName = mapUiProductToKosaItemName(productKey);
+  const startDate = yymmToMonthStartDate(common.normalizedStart);
+  const endDate = yymmToMonthStartDate(common.normalizedEnd);
+  const { data, error } = await supabase
+    .from(KOSA_CONTINENT_TABLE)
+    .select("year_month, qty, amount")
+    .eq("flow_type", tradeDirection)
+    .eq("item_name", mappedItemName)
+    .eq("region_name", regionName)
+    .gte("year_month", startDate)
+    .lte("year_month", endDate)
+    .order("year_month", { ascending: true });
 
-  const countryCodes = getCountryIdsByContinentCode(continentCode);
-  if (countryCodes.length === 0) {
+  if (error) {
     return {
       ok: false,
       rows: [],
       apiType: "continent",
-      error: `대륙코드 ${continentCode}에 매핑된 국가가 없습니다.`,
+      error: `대륙별 Supabase 조회 실패: ${error.message}`,
     };
   }
 
-  const perCountryRows: TradeRow[] = [];
-  const allSettled: NitemtradeSettled[] = [];
-  for (let i = 0; i < countryCodes.length; i += NITEMTRADE_ALL_COUNTRIES_PARALLEL) {
-    const batch = countryCodes.slice(i, i + NITEMTRADE_ALL_COUNTRIES_PARALLEL);
-    const results = await Promise.all(
-      batch.map((cc) =>
-        runNitemtradeForCountry(cc, serviceKey, tradeDirection, common, hsList, windows),
-      ),
-    );
-    for (const r of results) {
-      perCountryRows.push(...r.rows);
-      allSettled.push(...r.settled);
-    }
+  const monthly = new Map<string, { qty: number; amountUsd: number }>();
+  for (const r of data ?? []) {
+    const ym = String((r as { year_month: unknown }).year_month ?? "").replace(/\D/g, "").slice(0, 6);
+    if (!/^\d{6}$/.test(ym)) continue;
+    const month = `${ym.slice(0, 4)}-${ym.slice(4, 6)}`;
+    const qty = Number((r as { qty: unknown }).qty ?? 0);
+    const amountUsd = Number((r as { amount: unknown }).amount ?? 0);
+    const cur = monthly.get(month) ?? { qty: 0, amountUsd: 0 };
+    cur.qty += Number.isFinite(qty) ? qty : 0;
+    cur.amountUsd += Number.isFinite(amountUsd) ? amountUsd : 0;
+    monthly.set(month, cur);
   }
 
-  const merged = mergeRowsByMonth(perCountryRows);
-  const debugWhenEmpty =
-    merged.length === 0
-      ? (allSettled
-          .map((s) => s.debug)
-          .find((d) => d.extractedRawItems > 0) ?? allSettled[0]?.debug)
-      : undefined;
-
-  const anySuccess = allSettled.some((r) => r.rows.length > 0);
-  const someFailed = allSettled.some((r) => r.rows.length === 0);
-  const chunked = windows.length > 1;
+  const rows: TradeRow[] = [...monthly.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, v]) => ({
+      month,
+      weight: Math.round((v.qty / 1000) * 1_000_000) / 1_000_000,
+      amount: Math.round((v.amountUsd / 1_000_000) * 1_000_000) / 1_000_000,
+    }));
 
   return {
     ok: true,
-    rows: merged,
+    rows,
     apiType: "continent",
     notice:
-      merged.length === 0
-        ? "대륙별 API 응답 파싱 결과 비어 있음 — hsSgn 지원 여부·필드명·기간을 확인하세요."
-        : [
-            someFailed && anySuccess
-              ? "일부 HS·기간 구간 요청은 실패했으나, 성공한 구간만 합산했습니다."
-              : null,
-            `대륙코드 ${continentCode} 매핑 국가 ${countryCodes.length}개를 국가별 API로 조회 후 월별 합산했습니다.`,
-            chunked
-              ? `조회 기간을 ${API_YXMM_CHUNK_MONTHS}개월 단위로 나누어 호출한 뒤 월별로 합쳤습니다.`
-              : null,
-          ]
-            .filter(Boolean)
-            .join(" ") || undefined,
-    ...(merged.length === 0 && debugWhenEmpty ? { debug: debugWhenEmpty } : {}),
+      rows.length === 0
+        ? "대륙별 Supabase 조회 결과가 비어 있습니다. 조건(flow_type/item_name/region_name/year_month)을 확인하세요."
+        : `대륙별은 Supabase(${KOSA_CONTINENT_TABLE})에서 조회했습니다. item_name="${mappedItemName}", region_name="${regionName}"`,
   };
 }
 
@@ -566,19 +786,6 @@ async function handleContinentProduct(
  * 수출입총괄: apiType=overall, strtYymm, endYymm, imexTpcd, pageNo(기본 1), numOfRows(기본 999)
  */
 export async function GET(req: NextRequest): Promise<NextResponse<TradeApiResponse>> {
-  const serviceKey = getServiceKey();
-  if (!serviceKey) {
-    return NextResponse.json(
-      {
-        ok: false,
-        rows: [],
-        apiType: "overall",
-        error: "서버 환경변수 TRADE_API_KEY 가 설정되지 않았습니다.",
-      },
-      { status: 200 },
-    );
-  }
-
   const { searchParams } = new URL(req.url);
   const productKey = searchParams.get("productKey")?.trim();
   const countryId = searchParams.get("countryId")?.trim();
@@ -595,7 +802,6 @@ export async function GET(req: NextRequest): Promise<NextResponse<TradeApiRespon
           return NextResponse.json(
             await handleContinentProduct(
               searchParams,
-              serviceKey,
               tradeDirection,
               continentCode,
             ),
@@ -611,6 +817,15 @@ export async function GET(req: NextRequest): Promise<NextResponse<TradeApiRespon
       }
 
       if (countryId) {
+        const serviceKey = getServiceKey();
+        if (!serviceKey) {
+          return NextResponse.json({
+            ok: false,
+            rows: [],
+            apiType: "nitemtrade",
+            error: "서버 환경변수 TRADE_API_KEY 가 설정되지 않았습니다.",
+          });
+        }
         return NextResponse.json(
           await handleNitemtrade(searchParams, serviceKey, tradeDirection),
         );
@@ -627,6 +842,15 @@ export async function GET(req: NextRequest): Promise<NextResponse<TradeApiRespon
 
     const apiType = (searchParams.get("apiType") || "overall") as TradeApiType;
     if (apiType === "overall") {
+      const serviceKey = getServiceKey();
+      if (!serviceKey) {
+        return NextResponse.json({
+          ok: false,
+          rows: [],
+          apiType: "overall",
+          error: "서버 환경변수 TRADE_API_KEY 가 설정되지 않았습니다.",
+        });
+      }
       return NextResponse.json(await handleOverall(searchParams, serviceKey));
     }
 

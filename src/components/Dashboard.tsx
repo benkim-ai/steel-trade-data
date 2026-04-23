@@ -15,10 +15,27 @@ import { TradeChart } from "@/components/TradeChart";
 import type { TradeApiResponse, TradeRow } from "@/types/trade";
 
 const HS_PRODUCT_KEYS = Object.keys(HS_CODE_MAP);
+const KOREAN_MONTH_LABELS = [
+  "1월",
+  "2월",
+  "3월",
+  "4월",
+  "5월",
+  "6월",
+  "7월",
+  "8월",
+  "9월",
+  "10월",
+  "11월",
+  "12월",
+] as const;
+const MIN_PICKER_YEAR = 2010;
+const MAX_PICKER_YEAR = new Date().getFullYear();
 
 export type TradeDirection = "import" | "export";
 
 export type RegionScopeTab = "country" | "continent";
+type PeriodGranularity = "monthly" | "yearly";
 
 /** 국가별: 단일 cntyCd 또는 전체 합계(ALL) */
 export type CountryChoiceId = CustomsCountryId | typeof COUNTRY_FILTER_ALL;
@@ -26,6 +43,8 @@ export type CountryChoiceId = CustomsCountryId | typeof COUNTRY_FILTER_ALL;
 type EnrichedRow = TradeRow & {
   /** 수입·수출 단가 = 금액×1000/중량(천톤) — 금액 백만 USD, 예: 33.27·42.29 → ≈787 */
   unitPrice: number;
+  /** 연단위 동기간 비교(YTD) 여부 */
+  isYtdComparison: boolean;
   /** 중량 전년 동월比(YoY) */
   yoyDisplay: string;
   yoyValue: number | null;
@@ -39,8 +58,11 @@ type EnrichedRow = TradeRow & {
 
 type FilterSnapshot = {
   regionTab: RegionScopeTab;
+  periodMode: PeriodGranularity;
   startMonth: string;
   endMonth: string;
+  startYear: number;
+  endYear: number;
   productKey: string;
   countryId: CountryChoiceId;
   continentCode: CustomsContinentCode;
@@ -59,6 +81,11 @@ function getDefaultRecentYearRange(): { startMonth: string; endMonth: string } {
   return { startMonth: toYm(start), endMonth: toYm(end) };
 }
 
+function getDefaultYearRange(endMonth: string): { startYear: number; endYear: number } {
+  const endYear = monthValueToParts(endMonth).year;
+  return { startYear: Math.max(MIN_PICKER_YEAR, endYear - 4), endYear };
+}
+
 /** `YYYY-MM` 기준으로 `delta`개월 이동 */
 function addCalendarMonthsYm(ym: string, delta: number): string {
   const [y, m] = ym.split("-").map(Number);
@@ -66,12 +93,21 @@ function addCalendarMonthsYm(ym: string, delta: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
-/** 수입·수출 단가: 금액(백만 USD)×1000 ÷ 중량(천톤) */
-function unitPriceFromRow(row: TradeRow): number {
+/** 국가별 API: 금액(백만 USD)×1000 ÷ 중량(천톤) = USD/톤 */
+function unitPriceFromCountryRow(row: TradeRow): number {
   const { amount, weight } = row;
   if (weight === 0 || !Number.isFinite(weight)) return 0;
   if (!Number.isFinite(amount)) return 0;
   return (amount * 1000) / weight;
+}
+
+/** 대륙별도 API 레이어에서 중량을 천톤으로 정규화하므로 국가별과 동일 공식 사용 */
+function unitPriceFromContinentRow(row: TradeRow): number {
+  return unitPriceFromCountryRow(row);
+}
+
+function roundToTwo(v: number): number {
+  return Math.round(v * 100) / 100;
 }
 
 function pctDisplay(v: number): string {
@@ -83,14 +119,19 @@ function pctDisplay(v: number): string {
  * 전년 동월(같은 달, 12개월 전) 대비 중량·금액·단가 증감률(YoY).
  * 조회 시작월보다 12개월 이전 구간을 API로 받아 두면 첫 행도 채워짐.
  */
-function enrichTradeRows(rows: TradeRow[]): EnrichedRow[] {
+function enrichTradeRows(
+  rows: TradeRow[],
+  regionTab: RegionScopeTab,
+): EnrichedRow[] {
   const sorted = [...rows].sort((a, b) => a.month.localeCompare(b.month));
   const byMonth = new Map(sorted.map((r) => [r.month, r]));
+  const unitPriceFromRow =
+    regionTab === "continent" ? unitPriceFromContinentRow : unitPriceFromCountryRow;
 
   return sorted.map((row) => {
     const unitPrice = unitPriceFromRow(row);
-    const prevYearMonth = addCalendarMonthsYm(row.month, -12);
-    const prevYear = byMonth.get(prevYearMonth);
+    const prevPeriod = addCalendarMonthsYm(row.month, -12);
+    const prevYear = byMonth.get(prevPeriod);
 
     let yoyDisplay = "-";
     let yoyValue: number | null = null;
@@ -120,6 +161,105 @@ function enrichTradeRows(rows: TradeRow[]): EnrichedRow[] {
     return {
       ...row,
       unitPrice,
+      isYtdComparison: false,
+      yoyDisplay,
+      yoyValue,
+      yoyAmountDisplay,
+      yoyAmountValue,
+      unitPriceYoyDisplay,
+      unitPriceYoyValue,
+    };
+  });
+}
+
+function enrichYearlyTradeRows(
+  monthlyRows: TradeRow[],
+  regionTab: RegionScopeTab,
+): EnrichedRow[] {
+  const unitPriceFromRow =
+    regionTab === "continent" ? unitPriceFromContinentRow : unitPriceFromCountryRow;
+  const monthlyByKey = new Map(monthlyRows.map((row) => [row.month, row]));
+  const yearly = new Map<
+    string,
+    { weight: number; amount: number; months: Set<number> }
+  >();
+
+  for (const row of monthlyRows) {
+    const match = /^(\d{4})-(\d{2})$/.exec(row.month);
+    if (!match) continue;
+    const year = match[1];
+    const monthNumber = Number(match[2]);
+    const cur = yearly.get(year) ?? { weight: 0, amount: 0, months: new Set<number>() };
+    cur.weight += row.weight;
+    cur.amount += row.amount;
+    cur.months.add(monthNumber);
+    yearly.set(year, cur);
+  }
+
+  const yearlyRows: TradeRow[] = [...yearly.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, v]) => ({
+      month,
+      weight: Math.round(v.weight * 1_000_000) / 1_000_000,
+      amount: Math.round(v.amount * 1_000_000) / 1_000_000,
+    }));
+
+  return yearlyRows.map((row) => {
+    const unitPrice = unitPriceFromRow(row);
+    const prevYearKey = String(Number(row.month) - 1);
+    const currentMonths = [...(yearly.get(row.month)?.months ?? new Set<number>())].sort(
+      (a, b) => a - b,
+    );
+    const isYtdComparison = currentMonths.length > 0 && currentMonths.length < 12;
+
+    let prevComparable: TradeRow | null = null;
+    if (currentMonths.length > 0) {
+      let weight = 0;
+      let amount = 0;
+      for (const monthNumber of currentMonths) {
+        const monthKey = `${prevYearKey}-${String(monthNumber).padStart(2, "0")}`;
+        const prevMonthRow = monthlyByKey.get(monthKey);
+        if (!prevMonthRow) continue;
+        weight += prevMonthRow.weight;
+        amount += prevMonthRow.amount;
+      }
+      prevComparable = {
+        month: prevYearKey,
+        weight: Math.round(weight * 1_000_000) / 1_000_000,
+        amount: Math.round(amount * 1_000_000) / 1_000_000,
+      };
+    }
+
+    let yoyDisplay = "-";
+    let yoyValue: number | null = null;
+    if (prevComparable && prevComparable.weight > 0) {
+      yoyValue = Math.round(((row.weight - prevComparable.weight) / prevComparable.weight) * 1000) / 10;
+      yoyDisplay = `${pctDisplay(yoyValue)}${isYtdComparison ? " (YTD)" : ""}`;
+    }
+
+    let yoyAmountDisplay = "-";
+    let yoyAmountValue: number | null = null;
+    if (prevComparable && Math.abs(prevComparable.amount) > 1e-12) {
+      yoyAmountValue =
+        Math.round(((row.amount - prevComparable.amount) / prevComparable.amount) * 1000) / 10;
+      yoyAmountDisplay = `${pctDisplay(yoyAmountValue)}${isYtdComparison ? " (YTD)" : ""}`;
+    }
+
+    let unitPriceYoyDisplay = "-";
+    let unitPriceYoyValue: number | null = null;
+    if (prevComparable && prevComparable.weight > 0) {
+      const prevUnitPrice = unitPriceFromRow(prevComparable);
+      if (prevUnitPrice > 0 && unitPrice >= 0) {
+        unitPriceYoyValue =
+          Math.round(((unitPrice - prevUnitPrice) / prevUnitPrice) * 1000) / 10;
+        unitPriceYoyDisplay = `${pctDisplay(unitPriceYoyValue)}${isYtdComparison ? " (YTD)" : ""}`;
+      }
+    }
+
+    return {
+      ...row,
+      unitPrice,
+      isYtdComparison,
       yoyDisplay,
       yoyValue,
       yoyAmountDisplay,
@@ -131,6 +271,7 @@ function enrichTradeRows(rows: TradeRow[]): EnrichedRow[] {
 }
 
 function formatMonthDot(ym: string): string {
+  if (/^\d{4}$/.test(ym)) return ym;
   const [y, m] = ym.split("-");
   if (!y || !m) return ym;
   return `${y}.${m}`;
@@ -140,9 +281,42 @@ function monthInputToYymm(ym: string): string {
   return ym.replace(/-/g, "").slice(0, 6);
 }
 
+function monthValueToParts(ym: string): { year: number; monthIndex: number } {
+  const [yearRaw, monthRaw] = ym.split("-").map(Number);
+  const fallback = new Date();
+  const year = Number.isFinite(yearRaw) ? yearRaw : fallback.getFullYear();
+  const month = Number.isFinite(monthRaw) ? monthRaw : fallback.getMonth() + 1;
+  return {
+    year,
+    monthIndex: Math.max(0, Math.min(11, month - 1)),
+  };
+}
+
+function buildMonthValue(year: number, monthIndex: number): string {
+  return `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+}
+
 function normalizeMonthRange(s: string, e: string): { start: string; end: string } {
   if (s <= e) return { start: s, end: e };
   return { start: e, end: s };
+}
+
+function normalizeYearRange(s: number, e: number): { start: number; end: number } {
+  return s <= e ? { start: s, end: e } : { start: e, end: s };
+}
+
+function clampPickerYear(year: number): number {
+  if (!Number.isFinite(year)) return MAX_PICKER_YEAR;
+  return Math.max(MIN_PICKER_YEAR, Math.min(MAX_PICKER_YEAR, Math.trunc(year)));
+}
+
+function periodRangeLabel(s: FilterSnapshot): string {
+  if (s.periodMode === "yearly") {
+    return s.startYear === s.endYear
+      ? `${s.startYear}`
+      : `${s.startYear}~${s.endYear}`;
+  }
+  return `${formatMonthDot(s.startMonth)}~${formatMonthDot(s.endMonth)}`;
 }
 
 function regionLabelFromSnap(s: FilterSnapshot): string {
@@ -160,20 +334,21 @@ function regionLabelFromSnap(s: FilterSnapshot): string {
   return `${cname} · ${s.productKey}`;
 }
 
-/** 차트 회색 막대 범례: 「일본산 중후판」형 (대륙은 ○○산 품목, 전체는 전체 품목) */
-function tradeChartBarLegend(s: FilterSnapshot): string {
+/** 차트 회색 막대 범례: 수입은 「일본산」, 수출은 「일본향」 */
+function tradeChartBarLegend(s: FilterSnapshot, direction: TradeDirection): string {
+  const suffix = direction === "import" ? "산" : "향";
   if (s.regionTab === "continent") {
     const name =
       CUSTOMS_CONTINENT_OPTIONS.find((o) => o.code === s.continentCode)?.name ??
       String(s.continentCode);
-    return `${name}산 ${s.productKey}`;
+    return `${name}${suffix} ${s.productKey}`;
   }
   if (s.countryId === COUNTRY_FILTER_ALL) {
     return `전체 ${s.productKey}`;
   }
   const cname =
     CUSTOMS_COUNTRY_OPTIONS.find((o) => o.id === s.countryId)?.name ?? s.countryId;
-  return `${cname}산 ${s.productKey}`;
+  return `${cname}${suffix} ${s.productKey}`;
 }
 
 function apiLabelForTab(tab: RegionScopeTab): string {
@@ -192,7 +367,7 @@ function RegionScopeTabs({
     { id: "continent", label: "대륙별" },
   ];
   return (
-    <div className="flex flex-wrap gap-1 border-b border-slate-300">
+    <div className="grid grid-cols-2 gap-1 rounded-full bg-white/32 p-1 ring-1 ring-white/60">
       {items.map((item) => {
         const active = item.id === value;
         return (
@@ -200,16 +375,321 @@ function RegionScopeTabs({
             key={item.id}
             type="button"
             onClick={() => onChange(item.id)}
-            className={`px-4 py-2.5 text-base -mb-px border-b-2 font-semibold transition-colors ${
+            className={`rounded-full px-4 py-2.5 text-sm font-semibold transition-colors ${
               active
-                ? "border-brand-navy text-brand-navy"
-                : "border-transparent text-slate-700 hover:text-slate-900"
+                ? "bg-[#303030] text-white shadow-sm"
+                : "text-neutral-700 hover:bg-white/50 hover:text-[#303030]"
             }`}
           >
             {item.label}
           </button>
         );
       })}
+    </div>
+  );
+}
+
+function PeriodModeTabs({
+  value,
+  onChange,
+}: {
+  value: PeriodGranularity;
+  onChange: (id: PeriodGranularity) => void;
+}) {
+  const items: { id: PeriodGranularity; label: string }[] = [
+    { id: "monthly", label: "월단위" },
+    { id: "yearly", label: "연단위" },
+  ];
+  return (
+    <div className="grid grid-cols-2 gap-1 rounded-full bg-white/32 p-1 ring-1 ring-white/60">
+      {items.map((item) => {
+        const active = item.id === value;
+        return (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => onChange(item.id)}
+            className={`rounded-full px-4 py-2.5 text-sm font-semibold transition-colors ${
+              active
+                ? "bg-[#303030] text-white shadow-sm"
+                : "text-neutral-700 hover:bg-white/50 hover:text-[#303030]"
+            }`}
+          >
+            {item.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function YearGridPicker({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  const safeValue = clampPickerYear(value);
+  const [displayYear, setDisplayYear] = useState(safeValue);
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement | null>(null);
+  const decadeStart = Math.floor(displayYear / 10) * 10;
+  const years = Array.from({ length: 12 }, (_, i) => decadeStart - 1 + i).filter(
+    (year) => year >= MIN_PICKER_YEAR && year <= MAX_PICKER_YEAR,
+  );
+
+  useEffect(() => {
+    if (!open) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
+
+  return (
+    <div ref={pickerRef} className="relative">
+      <button
+        type="button"
+        onClick={() => {
+          setDisplayYear(safeValue);
+          setOpen((current) => !current);
+        }}
+        className="glass-field flex w-full items-center justify-between gap-3 rounded-full px-4 py-3 text-left text-sm transition hover:bg-white/48 focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
+        aria-expanded={open}
+      >
+        <span>
+          <span className="block text-xs font-bold uppercase tracking-[0.16em] text-neutral-500">
+            {label}
+          </span>
+          <span className="mt-0.5 block font-semibold tabular-nums text-[#303030]">
+            {safeValue}년
+          </span>
+        </span>
+        <span
+          className="h-2.5 w-2.5 shrink-0 border-b-2 border-r-2 border-neutral-500 transition-transform"
+          style={{ transform: open ? "rotate(225deg)" : "rotate(45deg)" }}
+          aria-hidden="true"
+        />
+      </button>
+
+      {open ? (
+        <section className="absolute left-0 right-0 top-[calc(100%+10px)] z-40 rounded-[26px] bg-white p-4 shadow-[0_24px_64px_rgba(64,45,82,0.18)] ring-1 ring-neutral-200">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                setDisplayYear((year) => {
+                  const nextYear = Math.max(MIN_PICKER_YEAR, year - 10);
+                  return nextYear;
+                });
+              }}
+              disabled={decadeStart <= MIN_PICKER_YEAR}
+              className="grid h-9 w-9 place-items-center rounded-full bg-neutral-100 text-lg font-semibold text-neutral-500 shadow-sm transition hover:bg-neutral-200 hover:text-[#303030] disabled:cursor-not-allowed disabled:opacity-35"
+              aria-label={`${label} 이전 10년`}
+            >
+              ‹
+            </button>
+            <p className="text-lg font-semibold tabular-nums text-[#303030]">
+              {decadeStart}년대
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setDisplayYear((year) => {
+                  const nextYear = Math.min(MAX_PICKER_YEAR, year + 10);
+                  return nextYear;
+                });
+              }}
+              disabled={decadeStart + 10 > MAX_PICKER_YEAR}
+              className="grid h-9 w-9 place-items-center rounded-full bg-neutral-100 text-lg font-semibold text-neutral-500 shadow-sm transition hover:bg-neutral-200 hover:text-[#303030] disabled:cursor-not-allowed disabled:opacity-35"
+              aria-label={`${label} 다음 10년`}
+            >
+              ›
+            </button>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2">
+            {years.map((year) => {
+              const active = safeValue === year;
+              return (
+                <button
+                  key={year}
+                  type="button"
+                  onClick={() => {
+                    onChange(year);
+                    setOpen(false);
+                  }}
+                  className={`min-h-11 rounded-[14px] px-3 text-sm font-semibold transition ${
+                    active
+                      ? "bg-[#6f6f6f] text-white shadow-[0_12px_24px_rgba(48,48,48,0.18)]"
+                      : "text-[#303030] hover:bg-neutral-100"
+                  }`}
+                >
+                  {year}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function MonthGridPicker({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const selected = monthValueToParts(value);
+  const [displayYear, setDisplayYear] = useState(selected.year);
+  const [yearText, setYearText] = useState(String(selected.year));
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement | null>(null);
+  const yearInputId = `${label.replace(/\s/g, "-")}-year`;
+
+  const handleYearInput = (rawValue: string) => {
+    setYearText(rawValue);
+    const nextYear = Number(rawValue);
+    if (
+      rawValue.length === 4 &&
+      Number.isInteger(nextYear) &&
+      nextYear >= MIN_PICKER_YEAR &&
+      nextYear <= MAX_PICKER_YEAR
+    ) {
+      setDisplayYear(nextYear);
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
+
+  return (
+    <div ref={pickerRef} className="relative">
+      <button
+        type="button"
+        onClick={() => {
+          setDisplayYear(selected.year);
+          setYearText(String(selected.year));
+          setOpen((current) => !current);
+        }}
+        className="glass-field flex w-full items-center justify-between gap-3 rounded-full px-4 py-3 text-left text-sm transition hover:bg-white/48 focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
+        aria-expanded={open}
+      >
+        <span>
+          <span className="block text-xs font-bold uppercase tracking-[0.16em] text-neutral-500">
+            {label}
+          </span>
+          <span className="mt-0.5 block font-semibold tabular-nums text-[#303030]">
+            {selected.year}년 {KOREAN_MONTH_LABELS[selected.monthIndex]}
+          </span>
+        </span>
+        <span
+          className="h-2.5 w-2.5 shrink-0 border-b-2 border-r-2 border-neutral-500 transition-transform"
+          style={{ transform: open ? "rotate(225deg)" : "rotate(45deg)" }}
+          aria-hidden="true"
+        />
+      </button>
+
+      {open ? (
+        <section className="absolute left-0 right-0 top-[calc(100%+10px)] z-40 rounded-[26px] bg-white p-4 shadow-[0_24px_64px_rgba(64,45,82,0.18)] ring-1 ring-neutral-200">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                setDisplayYear((year) => {
+                  const nextYear = Math.max(MIN_PICKER_YEAR, year - 1);
+                  setYearText(String(nextYear));
+                  return nextYear;
+                });
+              }}
+              disabled={displayYear <= MIN_PICKER_YEAR}
+              className="grid h-9 w-9 place-items-center rounded-full bg-neutral-100 text-lg font-semibold text-neutral-500 shadow-sm transition hover:bg-neutral-200 hover:text-[#303030] disabled:cursor-not-allowed disabled:opacity-35"
+              aria-label={`${label} 이전 연도`}
+            >
+              ‹
+            </button>
+            <p className="text-lg font-semibold tabular-nums text-[#303030]">
+              {displayYear}년
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setDisplayYear((year) => {
+                  const nextYear = Math.min(MAX_PICKER_YEAR, year + 1);
+                  setYearText(String(nextYear));
+                  return nextYear;
+                });
+              }}
+              disabled={displayYear >= MAX_PICKER_YEAR}
+              className="grid h-9 w-9 place-items-center rounded-full bg-neutral-100 text-lg font-semibold text-neutral-500 shadow-sm transition hover:bg-neutral-200 hover:text-[#303030] disabled:cursor-not-allowed disabled:opacity-35"
+              aria-label={`${label} 다음 연도`}
+            >
+              ›
+            </button>
+          </div>
+          <label htmlFor={yearInputId} className="mb-3 block">
+            <span className="sr-only">{label} 연도 검색</span>
+            <input
+              id={yearInputId}
+              type="number"
+              inputMode="numeric"
+              min={MIN_PICKER_YEAR}
+              max={MAX_PICKER_YEAR}
+              value={yearText}
+              onChange={(event) => handleYearInput(event.target.value)}
+              className="w-full rounded-full border border-neutral-200 bg-white px-4 py-2.5 text-center text-sm font-semibold tabular-nums text-[#303030] shadow-sm focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
+              aria-label={`${label} 연도 검색`}
+            />
+          </label>
+
+          <div className="grid grid-cols-3 gap-2">
+            {KOREAN_MONTH_LABELS.map((monthLabel, monthIndex) => {
+              const active =
+                selected.year === displayYear && selected.monthIndex === monthIndex;
+              return (
+                <button
+                  key={monthLabel}
+                  type="button"
+                  onClick={() => {
+                    onChange(buildMonthValue(displayYear, monthIndex));
+                    setOpen(false);
+                  }}
+                  className={`min-h-11 rounded-[14px] px-3 text-sm font-semibold transition ${
+                    active
+                      ? "bg-[#6f6f6f] text-white shadow-[0_12px_24px_rgba(48,48,48,0.18)]"
+                      : "text-[#303030] hover:bg-neutral-100"
+                  }`}
+                >
+                  {monthLabel}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -221,26 +701,34 @@ type DashboardProps = {
 export function Dashboard({ tradeDirection }: DashboardProps) {
   const { startMonth: defaultStartMonth, endMonth: defaultEndMonth } =
     getDefaultRecentYearRange();
+  const { startYear: defaultStartYear, endYear: defaultEndYear } =
+    getDefaultYearRange(defaultEndMonth);
   const defaultProduct = HS_PRODUCT_KEYS.includes("철강재")
     ? "철강재"
     : (HS_PRODUCT_KEYS[0] ?? "");
 
   const [regionTab, setRegionTab] = useState<RegionScopeTab>("country");
+  const [periodMode, setPeriodMode] = useState<PeriodGranularity>("monthly");
   const [countryId, setCountryId] = useState<CountryChoiceId>(COUNTRY_FILTER_ALL);
   const [continentCode, setContinentCode] =
     useState<CustomsContinentCode>(DEFAULT_CONTINENT);
   const [countryQuery, setCountryQuery] = useState("");
   const [startMonth, setStartMonth] = useState(defaultStartMonth);
   const [endMonth, setEndMonth] = useState(defaultEndMonth);
+  const [startYear, setStartYear] = useState(defaultStartYear);
+  const [endYear, setEndYear] = useState(defaultEndYear);
   const [productKey, setProductKey] = useState(defaultProduct);
   const [hasSearched, setHasSearched] = useState(false);
 
   const [applied, setApplied] = useState<AppliedQuery>(() => ({
     regionTab: "country",
+    periodMode: "monthly",
     countryId: COUNTRY_FILTER_ALL,
     continentCode: DEFAULT_CONTINENT,
     startMonth: defaultStartMonth,
     endMonth: defaultEndMonth,
+    startYear: defaultStartYear,
+    endYear: defaultEndYear,
     productKey: defaultProduct,
   }));
 
@@ -250,8 +738,11 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
 
   const snapRef = useRef<FilterSnapshot>({
     regionTab: "country",
+    periodMode: "monthly",
     startMonth: defaultStartMonth,
     endMonth: defaultEndMonth,
+    startYear: defaultStartYear,
+    endYear: defaultEndYear,
     countryId: COUNTRY_FILTER_ALL,
     continentCode: DEFAULT_CONTINENT,
     productKey: defaultProduct,
@@ -260,13 +751,26 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
   useEffect(() => {
     snapRef.current = {
       regionTab,
+      periodMode,
       startMonth,
       endMonth,
+      startYear,
+      endYear,
       countryId,
       continentCode,
       productKey,
     };
-  }, [startMonth, endMonth, countryId, continentCode, productKey, regionTab]);
+  }, [
+    startMonth,
+    endMonth,
+    startYear,
+    endYear,
+    countryId,
+    continentCode,
+    productKey,
+    regionTab,
+    periodMode,
+  ]);
 
   const filteredCountryOptions = useMemo(() => {
     const q = countryQuery.trim().toLowerCase();
@@ -284,15 +788,20 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
       setLoading(true);
       setRawRows([]);
       setFetchError(null);
-      const { start, end } = normalizeMonthRange(snap.startMonth, snap.endMonth);
-      /** 표·차트 첫 달 YoY용: 전년 동월이 되도록 조회 시작 12개월 앞부터 받음 */
-      const apiStartYm = addCalendarMonthsYm(start, -12);
+      const monthlyRange = normalizeMonthRange(snap.startMonth, snap.endMonth);
+      const yearlyRange = normalizeYearRange(snap.startYear, snap.endYear);
+      const apiStartYm =
+        snap.periodMode === "yearly"
+          ? `${yearlyRange.start - 1}-01`
+          : addCalendarMonthsYm(monthlyRange.start, -12);
+      const apiEndYm =
+        snap.periodMode === "yearly" ? `${yearlyRange.end}-12` : monthlyRange.end;
 
       const params = new URLSearchParams();
       params.set("tradeDirection", tradeDirection);
       params.set("productKey", snap.productKey);
       params.set("strtYymm", monthInputToYymm(apiStartYm));
-      params.set("endYymm", monthInputToYymm(end));
+      params.set("endYymm", monthInputToYymm(apiEndYm));
       params.set("regionMode", snap.regionTab === "continent" ? "continent" : "country");
       if (snap.regionTab === "continent") {
         params.set("continentCode", String(snap.continentCode));
@@ -343,44 +852,77 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
 
   const handleSearch = useCallback(() => {
     const { start, end } = normalizeMonthRange(startMonth, endMonth);
+    const yearRange = normalizeYearRange(startYear, endYear);
     if (start !== startMonth || end !== endMonth) {
       setStartMonth(start);
       setEndMonth(end);
     }
+    if (yearRange.start !== startYear || yearRange.end !== endYear) {
+      setStartYear(yearRange.start);
+      setEndYear(yearRange.end);
+    }
     setApplied({
       regionTab,
+      periodMode,
       countryId,
       continentCode,
       startMonth: start,
       endMonth: end,
+      startYear: yearRange.start,
+      endYear: yearRange.end,
       productKey,
     });
     setHasSearched(true);
     void loadTrade({
       regionTab,
+      periodMode,
       countryId,
       continentCode,
       startMonth: start,
       endMonth: end,
+      startYear: yearRange.start,
+      endYear: yearRange.end,
       productKey,
     });
   }, [
     continentCode,
     countryId,
     endMonth,
+    endYear,
     loadTrade,
+    periodMode,
     productKey,
     regionTab,
     startMonth,
+    startYear,
   ]);
 
-  const enrichedRows = useMemo(() => enrichTradeRows(rawRows), [rawRows]);
+  const enrichedRows = useMemo(
+    () =>
+      applied.periodMode === "yearly"
+        ? enrichYearlyTradeRows(rawRows, applied.regionTab)
+        : enrichTradeRows(rawRows, applied.regionTab),
+    [rawRows, applied.regionTab, applied.periodMode],
+  );
 
   const filteredRows = useMemo(() => {
+    if (applied.periodMode === "yearly") {
+      return enrichedRows.filter((r) => {
+        const year = Number(r.month);
+        return year >= applied.startYear && year <= applied.endYear;
+      });
+    }
     return enrichedRows.filter(
       (r) => r.month >= applied.startMonth && r.month <= applied.endMonth,
     );
-  }, [applied.endMonth, applied.startMonth, enrichedRows]);
+  }, [
+    applied.endMonth,
+    applied.endYear,
+    applied.periodMode,
+    applied.startMonth,
+    applied.startYear,
+    enrichedRows,
+  ]);
 
   const yoyPctWeightLine = useMemo(
     () => filteredRows.map((r) => r.yoyValue),
@@ -403,27 +945,41 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
   );
 
   const imexLabel = tradeDirection === "import" ? "수입" : "수출";
-  const pageTitle = `${imexLabel} 대시보드`;
-  const unitPriceColumnLabel =
-    tradeDirection === "import" ? "수입단가(백만 USD)" : "수출단가(백만 USD)";
+  const pageTitle = tradeDirection === "import" ? "Import" : "Export";
+  const unitPriceColumnLabel = tradeDirection === "import" ? "수입단가(USD)" : "수출단가(USD)";
 
   const regionLabel = useMemo(() => regionLabelFromSnap(applied), [applied]);
+  const summaryRegionLabel = useMemo(() => {
+    if (applied.regionTab === "continent") {
+      return (
+        CUSTOMS_CONTINENT_OPTIONS.find((o) => o.code === applied.continentCode)?.name ??
+        String(applied.continentCode)
+      );
+    }
+    if (applied.countryId === COUNTRY_FILTER_ALL) {
+      return "전체 국가";
+    }
+    return (
+      CUSTOMS_COUNTRY_OPTIONS.find((o) => o.id === applied.countryId)?.name ??
+      applied.countryId
+    );
+  }, [applied.continentCode, applied.countryId, applied.regionTab]);
 
   /** 차트 상단 전용(헤더와 동일 내용, 접두 없이 강조 표시) */
   const chartAppliedConditionsText = useMemo(() => {
-    return `[${imexLabel}] / [${apiLabelForTab(applied.regionTab)}] / ${regionLabel} / ${formatMonthDot(applied.startMonth)}~${formatMonthDot(applied.endMonth)}`;
+    return `[${imexLabel}] / [${apiLabelForTab(applied.regionTab)}] / ${regionLabel} / ${periodRangeLabel(applied)}`;
   }, [applied, imexLabel, regionLabel]);
 
   /** PNG 저장 시 파일명 앞부분 (예: `미국 · 중후판 / 2020.01~2023.05`) */
   const chartSaveImageNameStem = useMemo(
     () =>
-      `${regionLabelFromSnap(applied)} / ${formatMonthDot(applied.startMonth)}~${formatMonthDot(applied.endMonth)}`,
+      `${regionLabelFromSnap(applied)} / ${periodRangeLabel(applied)}`,
     [applied],
   );
 
   const chartCategories = filteredRows.map((r) => formatMonthDot(r.month));
   const chartMonths = filteredRows.map((r) => r.month);
-  const chartWeights = filteredRows.map((r) => r.weight);
+  const chartWeights = filteredRows.map((r) => roundToTwo(r.weight));
   const chartAmounts = filteredRows.map((r) => r.amount);
   const displayProductKeys = useMemo(() => {
     const keys = [...HS_PRODUCT_KEYS];
@@ -439,10 +995,13 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
     () =>
       [
         applied.regionTab,
+        applied.periodMode,
         applied.countryId,
         applied.continentCode,
         applied.startMonth,
         applied.endMonth,
+        applied.startYear,
+        applied.endYear,
         applied.productKey,
         tradeDirection,
         filteredRows.length,
@@ -451,82 +1010,108 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
   );
 
   const inputClass =
-    "w-full rounded-xl border-0 bg-slate-100 px-3 py-2.5 text-sm text-slate-800 shadow-inner ring-1 ring-slate-200/80 transition placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-navy/25";
+    "glass-field w-full rounded-full px-4 py-3 text-sm text-[#303030] transition placeholder:text-neutral-400 focus:bg-white/72 focus:outline-none focus:ring-2 focus:ring-yellow-300/70";
 
   const productGroupName = `hs-product-${tradeDirection}`;
   const countryGroupName = `country-${tradeDirection}`;
   const continentGroupName = `continent-${tradeDirection}`;
-
-  const introApiLine =
-    regionTab === "country"
-      ? "관세청 품목·국가별 수출입실적(GW) — 국가코드는 「관세청조회코드」엑셀 국가코드 시트와 동일한 목록입니다."
-      : "관세청 품목·대륙별 수출입실적(GW) — 대륙코드는 엑셀 「대륙코드」시트(10~99)와 동일합니다. HS별 병렬 호출 후 월별 합산합니다.";
+  const periodGroupLabel = applied.periodMode === "yearly" ? "연도" : "월";
+  const chartTitle = applied.periodMode === "yearly" ? "연도별 추이" : "월별 추이";
+  const yoyComparisonLabel =
+    applied.periodMode === "yearly" ? "전년比" : "전년 동월比";
 
   return (
-    <div className="flex min-h-0 w-full flex-1 flex-col">
-      <header className="shrink-0 border-b border-slate-200/80 bg-slate-50 px-6 py-5 md:px-8">
-        <div className="min-w-0">
-          <h1 className="text-xl font-semibold tracking-tight text-slate-900 md:text-2xl">
-            {pageTitle}
-          </h1>
+    <div className="flex min-h-0 w-full flex-1 flex-col px-4 pb-6 pt-5 sm:px-6 lg:px-8">
+      <header className="mx-auto w-full max-w-[1600px] shrink-0 px-1 py-5">
+        <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold uppercase tracking-[0.22em] text-neutral-500">
+              {imexLabel} dashboard
+            </p>
+            <h1 className="mt-3 text-4xl font-semibold tracking-normal text-black md:text-6xl">
+              {pageTitle}
+            </h1>
+          </div>
+          <div className="flex flex-wrap justify-start gap-2 text-right lg:justify-end">
+            <div className="glass-surface w-fit max-w-[12rem] rounded-full px-5 py-1.5">
+              <p className="truncate text-sm font-semibold text-[#303030]">
+                {applied.productKey}
+              </p>
+              <p className="text-[10px] font-medium leading-tight text-neutral-600">품목</p>
+            </div>
+            <div className="glass-surface w-fit max-w-[12rem] rounded-full px-5 py-1.5">
+              <p className="truncate text-sm font-semibold text-[#303030]">
+                {summaryRegionLabel}
+              </p>
+              <p className="text-[10px] font-medium leading-tight text-neutral-600">
+                {applied.regionTab === "continent" ? "대륙" : "국가"}
+              </p>
+            </div>
+            <div className="glass-surface w-fit rounded-full px-5 py-1.5">
+              <p className="text-sm font-semibold tabular-nums text-[#303030]">
+                {periodRangeLabel(applied)}
+              </p>
+              <p className="text-[10px] font-medium leading-tight text-neutral-600">기간</p>
+            </div>
+          </div>
         </div>
       </header>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-6 lg:flex-row lg:gap-8 lg:p-8">
+      <div className="mx-auto flex min-h-0 w-full max-w-[1600px] flex-1 flex-col gap-6 overflow-auto rounded-[36px] border border-white/50 bg-white/20 p-3 shadow-[0_30px_90px_rgba(30,30,30,0.12)] backdrop-blur-xl lg:flex-row lg:gap-6 lg:p-4">
         <section className="flex w-full min-w-0 flex-col gap-6 lg:w-[62%]">
-          <div className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80">
-            <p className="text-xs font-medium text-slate-500">{introApiLine}</p>
-          </div>
-
           {fetchError ? (
-            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <div className="rounded-[22px] border border-yellow-400/40 bg-yellow-100/62 px-4 py-3 text-sm text-[#303030] shadow-sm backdrop-blur-xl">
               {fetchError}
             </div>
           ) : null}
 
-          <article className="flex min-h-[320px] flex-col rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200/80">
+          <article className="glass-card flex min-h-[320px] flex-col rounded-[30px] p-6">
             <div className="mb-2 flex items-start justify-between gap-4">
               <div>
-                <h2 className="text-base font-semibold text-slate-900">월별 추이</h2>
+                <h2 className="text-[22px] font-semibold tracking-normal text-[#303030]">
+                  {chartTitle}
+                </h2>
               </div>
               {loading ? (
-                <span className="text-xs font-medium text-slate-500">불러오는 중…</span>
+                <span className="rounded-full bg-[#303030] px-3 py-1 text-xs font-medium text-white">
+                  불러오는 중...
+                </span>
               ) : null}
             </div>
 
             <div
-              className="mb-4 rounded-xl border border-brand-navy/20 bg-gradient-to-br from-slate-50 to-brand-navy/[0.06] px-4 py-3.5 shadow-inner ring-1 ring-slate-200/80"
+              className="glass-field mb-4 rounded-[22px] px-4 py-3.5"
               aria-label="차트에 적용된 조회 조건"
             >
-              <p className="text-[11px] font-bold uppercase tracking-wide text-brand-navy">
+              <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-neutral-500">
                 차트 적용 조건
               </p>
-              <p className="mt-2 break-words text-sm font-semibold leading-relaxed text-slate-900">
+              <p className="mt-2 break-words text-sm font-semibold leading-relaxed text-[#303030]">
                 {chartAppliedConditionsText}
               </p>
             </div>
 
             {!hasSearched ? (
-              <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50/80 py-24 text-center">
-                <p className="text-base font-semibold text-slate-700">
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-[24px] border border-dashed border-neutral-300/70 bg-white/34 py-24 text-center backdrop-blur-xl">
+                <p className="text-base font-semibold text-neutral-700">
                   데이터 조회 조건을 설정해주세요
                 </p>
               </div>
             ) : null}
             {!loading && hasSearched && filteredRows.length === 0 ? (
-              <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50/80 py-24 text-center">
-                <p className="text-base font-semibold text-slate-700">데이터 없음</p>
-                <p className="max-w-md text-sm text-slate-500">
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-[24px] border border-dashed border-neutral-300/70 bg-white/34 py-24 text-center backdrop-blur-xl">
+                <p className="text-base font-semibold text-neutral-700">데이터 없음</p>
+                <p className="max-w-md text-sm text-neutral-500">
                   API 응답에 파싱된 행이 없습니다. 콘솔의{" "}
-                  <code className="rounded bg-slate-200 px-1">[/api/trade] 전체 JSON</code>에
-                  포함된 <code className="rounded bg-slate-200 px-1">debug</code>(원시 XML
-                  앞부분·<code className="rounded bg-slate-200 px-1">firstItemKeys</code>·
+                  <code className="rounded bg-white/70 px-1">[/api/trade] 전체 JSON</code>에
+                  포함된 <code className="rounded bg-white/70 px-1">debug</code>(원시 XML
+                  앞부분·<code className="rounded bg-white/70 px-1">firstItemKeys</code>·
                   오류 메시지)와 서버 터미널 로그를 확인하세요.
                 </p>
               </div>
             ) : null}
             {loading ? (
-              <div className="flex flex-1 items-center justify-center rounded-xl border border-dashed border-slate-200 py-24 text-sm text-slate-500">
+              <div className="flex flex-1 items-center justify-center rounded-[24px] border border-dashed border-neutral-300/60 bg-white/28 py-24 text-sm text-neutral-500">
                 데이터를 불러오는 중입니다.
               </div>
             ) : null}
@@ -541,29 +1126,32 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                 yoyPctAmount={yoyPctAmountLine}
                 unitPrices={chartUnitPrices}
                 yoyPctUnitPrice={yoyPctUnitPriceLine}
-                barLegendText={tradeChartBarLegend(applied)}
+                barLegendText={tradeChartBarLegend(applied, tradeDirection)}
                 imexLabel={imexLabel}
+                yoyComparisonLabel={yoyComparisonLabel}
                 saveImageNameStem={chartSaveImageNameStem}
               />
             ) : null}
           </article>
 
-          <article className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200/80">
-            <h2 className="mb-4 text-base font-semibold text-slate-900">데이터 표</h2>
-            <div className="overflow-x-auto rounded-xl ring-1 ring-slate-100">
+          <article className="glass-card rounded-[30px] p-6">
+            <h2 className="mb-4 text-[22px] font-semibold tracking-normal text-[#303030]">
+              데이터 표
+            </h2>
+            <div className="soft-scrollbar overflow-x-auto rounded-[24px] bg-white/40 ring-1 ring-white/70">
               <table className="w-full min-w-[880px] border-collapse text-left text-sm">
                 <thead>
-                  <tr className="bg-slate-100/80 text-slate-600">
-                    <th className="px-4 py-3 font-semibold">월</th>
-                    <th className="px-4 py-3 font-semibold">중량(천톤)</th>
-                    <th className="px-4 py-3 font-semibold">중량 증감률(YoY)</th>
-                    <th className="px-4 py-3 font-semibold">금액(백만 USD)</th>
-                    <th className="px-4 py-3 font-semibold">금액 증감률(YoY)</th>
-                    <th className="px-4 py-3 font-semibold">{unitPriceColumnLabel}</th>
-                    <th className="px-4 py-3 font-semibold">단가 증감률(YoY)</th>
+                  <tr className="bg-[#303030] text-white">
+                    <th className="px-4 py-4 font-semibold">{periodGroupLabel}</th>
+                    <th className="px-4 py-4 font-semibold">중량(천톤)</th>
+                    <th className="px-4 py-4 font-semibold">중량 증감률(YoY)</th>
+                    <th className="px-4 py-4 font-semibold">금액(백만 USD)</th>
+                    <th className="px-4 py-4 font-semibold">금액 증감률(YoY)</th>
+                    <th className="px-4 py-4 font-semibold">{unitPriceColumnLabel}</th>
+                    <th className="px-4 py-4 font-semibold">단가 증감률(YoY)</th>
                   </tr>
                 </thead>
-                <tbody className="text-slate-800">
+                <tbody className="text-neutral-800">
                   {filteredRows.map((row) => {
                     const yoyClass = (v: number | null) => {
                       if (v === null) return "text-slate-500";
@@ -575,21 +1163,21 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                     return (
                       <tr
                         key={row.month}
-                        className="border-t border-slate-100 first:border-0"
+                        className="border-t border-white/70 first:border-0 hover:bg-white/38"
                       >
-                        <td className="px-4 py-3 tabular-nums">
+                        <td className="px-4 py-4 tabular-nums">
                           {formatMonthDot(row.month)}
                         </td>
-                        <td className="px-4 py-3 tabular-nums">
-                          {row.weight.toLocaleString(undefined, {
-                            maximumFractionDigits: 6,
+                        <td className="px-4 py-4 tabular-nums">
+                          {roundToTwo(row.weight).toLocaleString(undefined, {
+                            maximumFractionDigits: 2,
                             minimumFractionDigits: 0,
                           })}
                         </td>
-                        <td className={`px-4 py-3 tabular-nums ${yoyClass(row.yoyValue)}`}>
+                        <td className={`px-4 py-4 tabular-nums ${yoyClass(row.yoyValue)}`}>
                           {row.yoyDisplay}
                         </td>
-                        <td className="px-4 py-3 tabular-nums">
+                        <td className="px-4 py-4 tabular-nums">
                           {typeof row.amount === "number"
                             ? row.amount.toLocaleString(undefined, {
                                 maximumFractionDigits: 2,
@@ -597,17 +1185,17 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                             : row.amount}
                         </td>
                         <td
-                          className={`px-4 py-3 tabular-nums ${yoyClass(row.yoyAmountValue)}`}
+                          className={`px-4 py-4 tabular-nums ${yoyClass(row.yoyAmountValue)}`}
                         >
                           {row.yoyAmountDisplay}
                         </td>
-                        <td className="px-4 py-3 tabular-nums">
+                        <td className="px-4 py-4 tabular-nums">
                           {Number.isFinite(row.unitPrice)
                             ? Math.round(row.unitPrice).toLocaleString()
                             : "-"}
                         </td>
                         <td
-                          className={`px-4 py-3 tabular-nums ${yoyClass(row.unitPriceYoyValue)}`}
+                          className={`px-4 py-4 tabular-nums ${yoyClass(row.unitPriceYoyValue)}`}
                         >
                           {row.unitPriceYoyDisplay}
                         </td>
@@ -618,46 +1206,39 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
               </table>
             </div>
             {!hasSearched ? (
-              <p className="mt-3 text-center text-sm text-slate-500">
+              <p className="mt-3 text-center text-sm text-neutral-500">
                 데이터 조회 조건을 설정해주세요
               </p>
             ) : null}
             {hasSearched && filteredRows.length === 0 && !loading ? (
-              <p className="mt-3 text-center text-sm text-slate-500">
+              <p className="mt-3 text-center text-sm text-neutral-500">
                 기간을 조정하거나 TRADE_API_KEY·API 파라미터를 확인해 주세요.
               </p>
             ) : null}
           </article>
         </section>
 
-        <aside className="flex w-full shrink-0 flex-col gap-6 rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-300/90 lg:w-[38%]">
+        <aside className="glass-card flex w-full shrink-0 flex-col gap-6 rounded-[30px] p-6 lg:w-[38%]">
           <div>
-            <h2 className="text-xl font-bold tracking-tight text-slate-900">조건 설정</h2>
-            <p className="mt-2 text-sm leading-relaxed text-slate-700">
-              기간·필터를 맞춘 뒤{" "}
-              <span className="font-semibold text-slate-900">조회하기</span>로 조건을 확정합니다.
-              (외부 API는 서버 <code className="rounded bg-slate-200/90 px-1 py-0.5 text-xs text-slate-800">/api/trade</code>만 경유)
-            </p>
+            <h2 className="text-[22px] font-semibold tracking-normal text-[#303030]">
+              조건 설정
+            </h2>
           </div>
 
-          <div className="rounded-2xl bg-slate-100/90 p-1 ring-1 ring-slate-200">
+          <div>
             <RegionScopeTabs value={regionTab} onChange={setRegionTab} />
           </div>
 
           {regionTab === "country" ? (
             <fieldset className="space-y-2">
-              <legend className="text-sm font-bold tracking-tight text-slate-900">
-                국가 (cntyCd)
+              <legend className="text-sm font-bold tracking-tight text-[#303030]">
+                국가
               </legend>
-              <p className="text-xs leading-relaxed text-slate-600">
-                전체 합계는 관세청 국가코드 목록 전체에 대해 조회한 뒤 월별 중량·금액을 합산합니다. 데이터량이
-                많아 조회가 오래 걸릴 수 있습니다.
-              </p>
               <label
-                className={`flex cursor-pointer items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm transition-colors ${
+                className={`flex cursor-pointer items-center gap-3 rounded-full border px-3 py-2.5 text-sm transition-colors ${
                   countryId === COUNTRY_FILTER_ALL
-                    ? "border-brand-navy/20 bg-white font-medium text-brand-navy shadow-sm ring-1 ring-slate-200/80"
-                    : "bg-slate-50 text-slate-800 ring-1 ring-slate-100 hover:bg-white/90"
+                    ? "border-[#303030] bg-[#303030] font-medium text-white shadow-sm"
+                    : "border-white/60 bg-white/30 text-neutral-800 hover:bg-white/58"
                 }`}
               >
                 <input
@@ -665,10 +1246,10 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                   name={countryGroupName}
                   checked={countryId === COUNTRY_FILTER_ALL}
                   onChange={() => setCountryId(COUNTRY_FILTER_ALL)}
-                  className="h-4 w-4 shrink-0 border-slate-300 text-brand-navy focus:ring-brand-navy"
+                  className="h-4 w-4 shrink-0 border-neutral-300 text-[#303030] focus:ring-yellow-300"
                 />
-                <span className="tabular-nums text-slate-500">ALL</span>
-                <span className="min-w-0 flex-1 font-medium">전체 합계</span>
+                <span className="tabular-nums opacity-70">ALL</span>
+                <span className="min-w-0 flex-1 font-medium">전체 국가 합계</span>
               </label>
               <input
                 type="search"
@@ -678,19 +1259,19 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                 className={inputClass}
                 aria-label="국가 검색"
               />
-              <div className="max-h-[min(40vh,320px)] space-y-1 overflow-y-auto rounded-xl bg-slate-50 p-2 ring-1 ring-slate-100">
+              <div className="soft-scrollbar max-h-[min(40vh,320px)] space-y-1 overflow-y-auto rounded-[24px] bg-white/28 p-2 ring-1 ring-white/60">
                 {filteredCountryOptions.length === 0 ? (
-                  <p className="px-2 py-3 text-center text-sm text-slate-500">
+                  <p className="px-2 py-3 text-center text-sm text-neutral-500">
                     검색 결과 없음
                   </p>
                 ) : (
                   filteredCountryOptions.map((opt) => (
                     <label
                       key={opt.id}
-                      className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors ${
+                      className={`flex cursor-pointer items-center gap-3 rounded-full px-3 py-2 text-sm transition-colors ${
                         countryId === opt.id
-                          ? "bg-white font-medium text-brand-navy shadow-sm ring-1 ring-slate-200/80"
-                          : "text-slate-700 hover:bg-white/80"
+                          ? "bg-[#303030] font-medium text-white shadow-sm"
+                          : "text-neutral-700 hover:bg-white/56"
                       }`}
                     >
                       <input
@@ -698,9 +1279,9 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                         name={countryGroupName}
                         checked={countryId === opt.id}
                         onChange={() => setCountryId(opt.id)}
-                        className="h-4 w-4 shrink-0 border-slate-300 text-brand-navy focus:ring-brand-navy"
+                        className="h-4 w-4 shrink-0 border-neutral-300 text-[#303030] focus:ring-yellow-300"
                       />
-                      <span className="tabular-nums text-slate-500">{opt.id}</span>
+                      <span className="tabular-nums opacity-65">{opt.id}</span>
                       <span className="min-w-0 flex-1 truncate">{opt.name}</span>
                     </label>
                   ))
@@ -709,17 +1290,17 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             </fieldset>
           ) : (
             <fieldset className="space-y-2">
-              <legend className="text-sm font-bold tracking-tight text-slate-900">
-                대륙 (cntnEbkUnfcClsfCd)
+              <legend className="text-sm font-bold tracking-tight text-[#303030]">
+                대륙
               </legend>
-              <div className="space-y-1 rounded-xl bg-slate-50 p-2 ring-1 ring-slate-100">
+              <div className="space-y-1 rounded-[24px] bg-white/28 p-2 ring-1 ring-white/60">
                 {CUSTOMS_CONTINENT_OPTIONS.map((opt) => (
                   <label
                     key={opt.code}
-                    className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors ${
+                    className={`flex cursor-pointer items-center gap-3 rounded-full px-3 py-2.5 text-sm transition-colors ${
                       continentCode === opt.code
-                        ? "bg-white font-medium text-brand-navy shadow-sm ring-1 ring-slate-200/80"
-                        : "text-slate-700 hover:bg-white/80"
+                        ? "bg-[#303030] font-medium text-white shadow-sm"
+                        : "text-neutral-700 hover:bg-white/56"
                     }`}
                   >
                     <input
@@ -727,9 +1308,9 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                       name={continentGroupName}
                       checked={continentCode === opt.code}
                       onChange={() => setContinentCode(opt.code)}
-                      className="h-4 w-4 border-slate-300 text-brand-navy focus:ring-brand-navy"
+                      className="h-4 w-4 border-neutral-300 text-[#303030] focus:ring-yellow-300"
                     />
-                    <span className="tabular-nums text-slate-500">{opt.code}</span>
+                    <span className="tabular-nums opacity-65">{opt.code}</span>
                     <span className="min-w-0 flex-1">{opt.name}</span>
                   </label>
                 ))}
@@ -738,50 +1319,60 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
           )}
 
           <div className="space-y-3">
-            <span className="text-sm font-bold tracking-tight text-slate-900">
+            <span className="text-sm font-bold tracking-tight text-[#303030]">
               기간
             </span>
+            <PeriodModeTabs value={periodMode} onChange={setPeriodMode} />
             <div className="flex flex-col gap-3">
-              <label className="block text-sm text-slate-800">
-                <span className="mb-1.5 block text-sm font-semibold text-slate-800">
-                  시작 월
-                </span>
-                <input
-                  type="month"
-                  value={startMonth}
-                  onChange={(e) => setStartMonth(e.target.value)}
-                  className={inputClass}
-                />
-              </label>
-              <label className="block text-sm text-slate-800">
-                <span className="mb-1.5 block text-sm font-semibold text-slate-800">
-                  종료 월
-                </span>
-                <input
-                  type="month"
-                  value={endMonth}
-                  onChange={(e) => setEndMonth(e.target.value)}
-                  className={inputClass}
-                />
-              </label>
+              {periodMode === "monthly" ? (
+                <>
+                  <MonthGridPicker
+                    key={`start-${startMonth}`}
+                    label="시작 월"
+                    value={startMonth}
+                    onChange={setStartMonth}
+                  />
+                  <MonthGridPicker
+                    key={`end-${endMonth}`}
+                    label="종료 월"
+                    value={endMonth}
+                    onChange={setEndMonth}
+                  />
+                </>
+              ) : (
+                <>
+                  <YearGridPicker
+                    key={`start-year-${startYear}`}
+                    label="시작 연도"
+                    value={startYear}
+                    onChange={setStartYear}
+                  />
+                  <YearGridPicker
+                    key={`end-year-${endYear}`}
+                    label="종료 연도"
+                    value={endYear}
+                    onChange={setEndYear}
+                  />
+                </>
+              )}
             </div>
           </div>
 
           <fieldset className="shrink-0 space-y-3">
-            <legend className="text-sm font-bold tracking-tight text-slate-900">
+            <legend className="text-sm font-bold tracking-tight text-[#303030]">
               품목 (HS 코드 그룹)
             </legend>
-            <p className="text-xs leading-relaxed text-slate-600">
-              선택한 품목의 HS 코드 전체를 서버에서 병렬 조회·월별 합산합니다.
+            <p className="text-xs leading-relaxed text-neutral-600">
+              선택한 품목의 HS 코드 전체를 서버에서 병렬 조회한 뒤 선택한 기간 단위로 합산합니다.
             </p>
-            <div className="max-h-[min(36vh,280px)] space-y-1 overflow-y-auto rounded-xl bg-slate-50 p-2 ring-1 ring-slate-100">
+            <div className="soft-scrollbar max-h-[min(36vh,280px)] space-y-1 overflow-y-auto rounded-[24px] bg-white/28 p-2 ring-1 ring-white/60">
               {displayProductKeys.map((key) => (
                 <label
                   key={key}
-                  className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors ${
+                  className={`flex cursor-pointer items-center gap-3 rounded-full px-3 py-2.5 text-sm transition-colors ${
                     productKey === key
-                      ? "bg-white font-medium text-brand-navy shadow-sm ring-1 ring-slate-200/80"
-                      : "text-slate-700 hover:bg-white/80"
+                      ? "bg-[#303030] font-medium text-white shadow-sm"
+                      : "text-neutral-700 hover:bg-white/56"
                   }`}
                 >
                   <input
@@ -790,7 +1381,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
                     value={key}
                     checked={productKey === key}
                     onChange={() => setProductKey(key)}
-                    className="h-4 w-4 border-slate-300 text-brand-navy focus:ring-brand-navy"
+                    className="h-4 w-4 border-neutral-300 text-[#303030] focus:ring-yellow-300"
                   />
                   <span className="min-w-0 flex-1 truncate">{key}</span>
                 </label>
@@ -802,7 +1393,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             type="button"
             onClick={handleSearch}
             disabled={loading}
-            className="w-full shrink-0 rounded-xl bg-blue-600 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 enabled:active:scale-[0.99] disabled:opacity-60"
+            className="w-full shrink-0 rounded-full bg-[#8f82a8] py-3.5 text-sm font-extrabold text-white shadow-[0_14px_30px_rgba(79,63,104,0.24)] transition hover:bg-[#7f7398] enabled:active:scale-[0.99] disabled:opacity-60"
           >
             {loading ? "조회 중…" : "조회하기"}
           </button>

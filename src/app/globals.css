@@ -1,11 +1,14 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f8fafc;
-  --foreground: #0f172a;
-  --brand-navy: #0f2744;
-  --brand-navy-muted: #1e3a5f;
-  --brand-orange: #f97316;
+  --background: #fbfcdb;
+  --foreground: #303030;
+  --brand-navy: #303030;
+  --brand-navy-muted: #4a4a4a;
+  --brand-orange: #f6d84f;
+  --glass: rgba(255, 255, 255, 0.56);
+  --glass-strong: rgba(255, 255, 255, 0.72);
+  --ink-muted: #626262;
 }
 
 @theme inline {
@@ -19,7 +22,72 @@
 }
 
 body {
-  background: var(--background);
+  background-attachment: fixed;
+  background-image: linear-gradient(-20deg, #e9defa 0%, #fbfcdb 100%);
   color: var(--foreground);
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  content: "";
+  background:
+    radial-gradient(circle at 16% 12%, rgba(255, 255, 255, 0.72), transparent 24rem),
+    radial-gradient(circle at 82% 24%, rgba(246, 216, 79, 0.38), transparent 28rem),
+    radial-gradient(circle at 56% 82%, rgba(233, 222, 250, 0.54), transparent 30rem);
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+.glass-surface {
+  border: 1px solid rgba(255, 255, 255, 0.74);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.46), rgba(255, 255, 255, 0.18));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    0 26px 70px rgba(64, 45, 82, 0.13);
+  backdrop-filter: blur(30px) saturate(1.28);
+  -webkit-backdrop-filter: blur(30px) saturate(1.28);
+}
+
+.glass-card {
+  border: 1px solid rgba(255, 255, 255, 0.68);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.4), rgba(255, 255, 255, 0.14));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    0 22px 62px rgba(64, 45, 82, 0.12);
+  backdrop-filter: blur(28px) saturate(1.26);
+  -webkit-backdrop-filter: blur(28px) saturate(1.26);
+}
+
+.glass-field {
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.28);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    0 10px 28px rgba(64, 45, 82, 0.07);
+  backdrop-filter: blur(22px) saturate(1.2);
+  -webkit-backdrop-filter: blur(22px) saturate(1.2);
+}
+
+.soft-scrollbar {
+  scrollbar-color: rgba(38, 38, 38, 0.28) transparent;
+}
+
+.soft-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.soft-scrollbar::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: rgba(38, 38, 38, 0.22);
+  background-clip: padding-box;
 }

@@ -109,6 +109,16 @@ export function extractItemsFromParsed(
 
 /** YYYYMM 또는 YYYY-MM 등 → `YYYY-MM` */
 function normalizeMonthKey(raw: string): string | null {
+  const separated = raw.match(/^(\d{4})([./-])(\d{1,2})/);
+  if (separated) {
+    const month =
+      separated[2] === "." && separated[3].length === 1
+        ? `${separated[3]}0`
+        : separated[3].padStart(2, "0");
+    const mi = Number(month);
+    if (mi >= 1 && mi <= 12) return `${separated[1]}-${month}`;
+  }
+
   const digits = raw.replace(/\D/g, "");
   if (digits.length >= 6) {
     const y = digits.slice(0, 4);
@@ -119,15 +129,16 @@ function normalizeMonthKey(raw: string): string | null {
   return null;
 }
 
-/** 품목·국가별 API `year` 필드: "2016.01" → "2016-01" */
+/** 품목·국가별 API `year` 필드: "2016.01" → "2016-01", "2025.1" → "2025-10" */
 function monthFromYearDotField(item: Record<string, unknown>): string | null {
   const y = pickString(item, ["year", "Year"]);
   if (!y) return null;
-  const m = y.match(/^(\d{4})\.(\d{2})/);
+  const m = y.match(/^(\d{4})\.(\d{1,2})/);
   if (!m) return null;
-  const mi = Number(m[2]);
+  const month = m[2].length === 1 ? `${m[2]}0` : m[2];
+  const mi = Number(month);
   if (mi < 1 || mi > 12) return null;
-  return `${m[1]}-${m[2]}`;
+  return `${m[1]}-${month}`;
 }
 
 function monthFromItem(item: Record<string, unknown>): string | null {
