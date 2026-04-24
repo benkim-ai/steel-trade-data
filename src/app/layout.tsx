@@ -25,11 +25,21 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-const metadataBase = new URL(
-  process.env.NEXT_PUBLIC_SITE_URL?.trim() ||
+function resolveMetadataBaseUrl(): URL {
+  const raw =
+    process.env.NEXT_PUBLIC_SITE_URL?.trim() ||
     process.env.VERCEL_PROJECT_PRODUCTION_URL?.trim() ||
-    "http://localhost:3000",
-);
+    "http://localhost:3000";
+
+  const normalized = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  try {
+    return new URL(normalized);
+  } catch {
+    return new URL("http://localhost:3000");
+  }
+}
+
+const metadataBase = resolveMetadataBaseUrl();
 
 export const metadata: Metadata = {
   metadataBase,
