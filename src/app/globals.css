@@ -17,7 +17,7 @@
   --color-brand-navy: var(--brand-navy);
   --color-brand-navy-muted: var(--brand-navy-muted);
   --color-brand-orange: var(--brand-orange);
-  --font-sans: var(--font-geist-sans);
+  --font-sans: var(--font-paperlogy-sans);
   --font-mono: var(--font-geist-mono);
 }
 
@@ -25,7 +25,7 @@ body {
   background-attachment: fixed;
   background-image: linear-gradient(-20deg, #e9defa 0%, #fbfcdb 100%);
   color: var(--foreground);
-  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  font-family: var(--font-paperlogy-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 body::before {
