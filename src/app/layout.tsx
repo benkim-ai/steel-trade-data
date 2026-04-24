@@ -48,8 +48,8 @@ export const metadata: Metadata = {
   manifest: "/manifest.webmanifest",
   icons: {
     icon: [
+      { url: "/favicon.ico", rel: "shortcut icon", type: "image/x-icon" },
       { url: "/icon.png", type: "image/png" },
-      { url: "/icon.png", rel: "shortcut icon", type: "image/png" },
     ],
     apple: [{ url: "/apple-icon.png", type: "image/png" }],
   },
