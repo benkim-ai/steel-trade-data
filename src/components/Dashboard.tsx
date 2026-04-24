@@ -176,6 +176,7 @@ function enrichYearlyTradeRows(
   monthlyRows: TradeRow[],
   regionTab: RegionScopeTab,
 ): EnrichedRow[] {
+  const currentCalendarYear = new Date().getFullYear();
   const unitPriceFromRow =
     regionTab === "continent" ? unitPriceFromContinentRow : unitPriceFromCountryRow;
   const monthlyByKey = new Map(monthlyRows.map((row) => [row.month, row]));
@@ -206,14 +207,18 @@ function enrichYearlyTradeRows(
 
   return yearlyRows.map((row) => {
     const unitPrice = unitPriceFromRow(row);
-    const prevYearKey = String(Number(row.month) - 1);
+    const yearNumber = Number(row.month);
+    const prevYearKey = String(yearNumber - 1);
     const currentMonths = [...(yearly.get(row.month)?.months ?? new Set<number>())].sort(
       (a, b) => a - b,
     );
-    const isYtdComparison = currentMonths.length > 0 && currentMonths.length < 12;
+    const isYtdComparison =
+      yearNumber === currentCalendarYear &&
+      currentMonths.length > 0 &&
+      currentMonths.length < 12;
 
     let prevComparable: TradeRow | null = null;
-    if (currentMonths.length > 0) {
+    if (isYtdComparison && currentMonths.length > 0) {
       let weight = 0;
       let amount = 0;
       for (const monthNumber of currentMonths) {
@@ -228,6 +233,15 @@ function enrichYearlyTradeRows(
         weight: Math.round(weight * 1_000_000) / 1_000_000,
         amount: Math.round(amount * 1_000_000) / 1_000_000,
       };
+    } else {
+      const prevYearTotals = yearly.get(prevYearKey);
+      if (prevYearTotals) {
+        prevComparable = {
+          month: prevYearKey,
+          weight: Math.round(prevYearTotals.weight * 1_000_000) / 1_000_000,
+          amount: Math.round(prevYearTotals.amount * 1_000_000) / 1_000_000,
+        };
+      }
     }
 
     let yoyDisplay = "-";
@@ -734,6 +748,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
 
   const [rawRows, setRawRows] = useState<TradeRow[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState("데이터를 가져오는 중");
   const [fetchError, setFetchError] = useState<string | null>(null);
 
   const snapRef = useRef<FilterSnapshot>({
@@ -772,6 +787,22 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
     periodMode,
   ]);
 
+  useEffect(() => {
+    if (!loading) return;
+
+    const organizeTimer = window.setTimeout(() => {
+      setLoadingMessage("데이터를 정리하는 중");
+    }, 10000);
+    const waitMoreTimer = window.setTimeout(() => {
+      setLoadingMessage("조금만 더 기다려주세요");
+    }, 20000);
+
+    return () => {
+      window.clearTimeout(organizeTimer);
+      window.clearTimeout(waitMoreTimer);
+    };
+  }, [loading]);
+
   const filteredCountryOptions = useMemo(() => {
     const q = countryQuery.trim().toLowerCase();
     if (!q) return CUSTOMS_COUNTRY_OPTIONS;
@@ -785,6 +816,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
 
   const loadTrade = useCallback(
     async (snap: FilterSnapshot) => {
+      setLoadingMessage("데이터를 가져오는 중");
       setLoading(true);
       setRawRows([]);
       setFetchError(null);
@@ -839,12 +871,13 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
           );
         }
         setRawRows(Array.isArray(body.rows) ? body.rows : []);
-        if (body.error) setFetchError(body.error);
+        setFetchError(body.error ?? null);
       } catch (e) {
         setRawRows([]);
         setFetchError(e instanceof Error ? e.message : String(e));
       } finally {
         setLoading(false);
+        setLoadingMessage("데이터를 가져오는 중");
       }
     },
     [tradeDirection],
@@ -1074,7 +1107,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
               </div>
               {loading ? (
                 <span className="rounded-full bg-[#303030] px-3 py-1 text-xs font-medium text-white">
-                  불러오는 중...
+                  {loadingMessage}
                 </span>
               ) : null}
             </div>
@@ -1100,19 +1133,16 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             ) : null}
             {!loading && hasSearched && filteredRows.length === 0 ? (
               <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-[24px] border border-dashed border-neutral-300/70 bg-white/34 py-24 text-center backdrop-blur-xl">
-                <p className="text-base font-semibold text-neutral-700">데이터 없음</p>
+                <p className="text-base font-semibold text-neutral-700">데이터가 없습니다</p>
                 <p className="max-w-md text-sm text-neutral-500">
-                  API 응답에 파싱된 행이 없습니다. 콘솔의{" "}
-                  <code className="rounded bg-white/70 px-1">[/api/trade] 전체 JSON</code>에
-                  포함된 <code className="rounded bg-white/70 px-1">debug</code>(원시 XML
-                  앞부분·<code className="rounded bg-white/70 px-1">firstItemKeys</code>·
-                  오류 메시지)와 서버 터미널 로그를 확인하세요.
+                  선택한 조건에 해당하는 데이터가 없습니다.
                 </p>
               </div>
             ) : null}
             {loading ? (
-              <div className="flex flex-1 items-center justify-center rounded-[24px] border border-dashed border-neutral-300/60 bg-white/28 py-24 text-sm text-neutral-500">
-                데이터를 불러오는 중입니다.
+              <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-[24px] border border-dashed border-neutral-300/70 bg-white/34 py-24 text-center backdrop-blur-xl">
+                <p className="text-[24px] font-semibold text-neutral-700">{loadingMessage}</p>
+                <p className="text-[15px] text-neutral-500">조회 조건에 맞는 데이터를 준비하고 있습니다.</p>
               </div>
             ) : null}
             {!loading && hasSearched && filteredRows.length > 0 ? (
@@ -1211,9 +1241,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
               </p>
             ) : null}
             {hasSearched && filteredRows.length === 0 && !loading ? (
-              <p className="mt-3 text-center text-sm text-neutral-500">
-                기간을 조정하거나 TRADE_API_KEY·API 파라미터를 확인해 주세요.
-              </p>
+              <p className="mt-3 text-center text-sm text-neutral-500">데이터가 없습니다.</p>
             ) : null}
           </article>
         </section>
@@ -1393,7 +1421,7 @@ export function Dashboard({ tradeDirection }: DashboardProps) {
             type="button"
             onClick={handleSearch}
             disabled={loading}
-            className="w-full shrink-0 rounded-full bg-[#8f82a8] py-3.5 text-sm font-extrabold text-white shadow-[0_14px_30px_rgba(79,63,104,0.24)] transition hover:bg-[#7f7398] enabled:active:scale-[0.99] disabled:opacity-60"
+            className="w-full shrink-0 rounded-full bg-[#8f82a8] py-2 text-xl font-extrabold text-white shadow-[0_14px_30px_rgba(79,63,104,0.24)] transition hover:bg-[#7f7398] enabled:active:scale-[0.99] disabled:opacity-60"
           >
             {loading ? "조회 중…" : "조회하기"}
           </button>

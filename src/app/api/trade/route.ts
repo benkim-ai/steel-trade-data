@@ -4,7 +4,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { TRADE_API_URLS } from "@/constants/apiEndpoints";
 import {
+  getCountryTableNameAliases,
   mapContinentCodeToRegionName,
+  mapUiCountryToCountryTableName,
+  mapUiProductToCountryTableItemName,
   mapUiProductToKosaItemName,
 } from "@/constants/continentQueryMappings";
 import { CUSTOMS_COUNTRY_OPTIONS } from "@/constants/customsCountryCodes";
@@ -93,9 +96,9 @@ function emptyFetchDebug(msg: string): TradeParseDebug {
 const DEFAULT_PAGE_NO = "1";
 /** 월별 행 위주 응답에 맞춘 상한(한 창 기준) */
 const DEFAULT_NUM_OF_ROWS = "999";
-const STEEL_COUNTRY_TABLE =
+const COUNTRY_PRODUCT_TABLE =
   process.env.KOSA_STEEL_COUNTRY_TABLE?.trim() || "kosa_steel_country_data";
-const STEEL_COUNTRY_SUPABASE_END_YYMM = "202512";
+const COUNTRY_PRODUCT_SUPABASE_END_YYMM = "202512";
 
 /** 관세청 GW가 한 번에 긴 기간을 잘라 주는 경우가 있어, 최대 이 개월 단위로 나눠 호출 후 합산 */
 const API_YXMM_CHUNK_MONTHS = 12;
@@ -387,9 +390,10 @@ async function runItemtradeForAllCountries(
   return { rows: merged, settled: allSettled };
 }
 
-async function fetchSteelCountryRowsFromSupabase(
+async function fetchCountryProductRowsFromSupabase(
   tradeDirection: TradeXmlDirection,
-  countryName: string,
+  productKey: string,
+  countryNames: string[],
   startYymm: string,
   endYymm: string,
 ): Promise<{ rows: TradeRow[]; notice?: string; error?: string }> {
@@ -402,12 +406,15 @@ async function fetchSteelCountryRowsFromSupabase(
     };
   }
 
+  const mappedItemName = mapUiProductToCountryTableItemName(productKey);
+  const itemAliases = [...new Set([mappedItemName, mapUiProductToKosaItemName(productKey)])];
+
   const { data, error } = await supabase
-    .from(STEEL_COUNTRY_TABLE)
+    .from(COUNTRY_PRODUCT_TABLE)
     .select("year_month, qty, amount")
     .eq("flow_type", tradeDirection)
-    .eq("item_name", "철강재계")
-    .eq("country_name", countryName)
+    .in("item_name", itemAliases)
+    .in("country_name", countryNames)
     .gte("year_month", yymmToMonthStartDate(startYymm))
     .lte("year_month", yymmToMonthStartDate(endYymm))
     .order("year_month", { ascending: true });
@@ -415,7 +422,7 @@ async function fetchSteelCountryRowsFromSupabase(
   if (error) {
     return {
       rows: [],
-      error: `철강재 국가별 Supabase 조회 실패: ${error.message}`,
+      error: `국가별 Supabase 조회 실패: ${error.message}`,
     };
   }
 
@@ -446,7 +453,7 @@ async function fetchSteelCountryRowsFromSupabase(
     rows,
     notice:
       rows.length > 0
-        ? `철강재 2025년까지는 Supabase(${STEEL_COUNTRY_TABLE})에서 조회했습니다. country_name="${countryName}"`
+        ? `${productKey} 2025년까지는 Supabase(${COUNTRY_PRODUCT_TABLE})에서 조회했습니다. country_name=${countryNames.join("/")}, item_name=${itemAliases.join("/")}`
         : undefined,
   };
 }
@@ -512,24 +519,29 @@ async function handleNitemtrade(
     API_YXMM_CHUNK_MONTHS,
   );
 
-  const isSteelCountryHybrid =
-    productKey === "철강재" && countryId !== COUNTRY_FILTER_ALL;
-  if (isSteelCountryHybrid) {
-    const countryName =
-      CUSTOMS_COUNTRY_OPTIONS.find((o) => o.id === countryId)?.name ?? countryId;
+  const countryName =
+    countryId === COUNTRY_FILTER_ALL
+      ? "세계합"
+      : mapUiCountryToCountryTableName(
+          CUSTOMS_COUNTRY_OPTIONS.find((o) => o.id === countryId)?.name ?? countryId,
+        );
+  const countryNameAliases = getCountryTableNameAliases(countryName);
+  const shouldUseCountrySupabase =
+    common.normalizedStart <= COUNTRY_PRODUCT_SUPABASE_END_YYMM;
+  if (shouldUseCountrySupabase) {
 
     const supabaseEnd =
-      common.normalizedEnd < STEEL_COUNTRY_SUPABASE_END_YYMM
+      common.normalizedEnd < COUNTRY_PRODUCT_SUPABASE_END_YYMM
         ? common.normalizedEnd
-        : STEEL_COUNTRY_SUPABASE_END_YYMM;
-    const shouldUseSupabase = common.normalizedStart <= STEEL_COUNTRY_SUPABASE_END_YYMM;
+        : COUNTRY_PRODUCT_SUPABASE_END_YYMM;
 
     let supabaseRows: TradeRow[] = [];
     const notices: string[] = [];
-    if (shouldUseSupabase) {
-      const supabasePart = await fetchSteelCountryRowsFromSupabase(
+    {
+      const supabasePart = await fetchCountryProductRowsFromSupabase(
         tradeDirection,
-        countryName,
+        productKey,
+        countryNameAliases,
         common.normalizedStart,
         supabaseEnd,
       );
@@ -546,7 +558,7 @@ async function handleNitemtrade(
     }
 
     const apiStart =
-      common.normalizedStart > STEEL_COUNTRY_SUPABASE_END_YYMM
+      common.normalizedStart > COUNTRY_PRODUCT_SUPABASE_END_YYMM
         ? common.normalizedStart
         : "202601";
 
@@ -557,30 +569,54 @@ async function handleNitemtrade(
         common.normalizedEnd,
         API_YXMM_CHUNK_MONTHS,
       );
-      const apiPart = await runNitemtradeForCountry(
-        countryId,
-        serviceKey,
-        tradeDirection,
-        common,
-        hsList,
-        apiWindows,
-      );
-      const failedAttempts = apiPart.settled.filter((r) => !r.ok);
-      if (failedAttempts.length > 0) {
-        const sampleFailures = failedAttempts
-          .slice(0, 3)
-          .map((r) => r.requestLabel)
-          .join(" / ");
-        return {
-          ok: false,
-          rows: [],
-          apiType: "nitemtrade",
-          error: `철강재 2026년 이후 API 요청 ${apiPart.settled.length}건 중 ${failedAttempts.length}건이 끝까지 실패했습니다. 잠시 후 다시 시도해 주세요.${sampleFailures ? ` 예시: ${sampleFailures}` : ""}`,
-        };
+      if (countryId === COUNTRY_FILTER_ALL) {
+        const allPart = await runItemtradeForAllCountries(
+          serviceKey,
+          tradeDirection,
+          common,
+          hsList,
+          apiWindows,
+        );
+        const failedAttempts = allPart.settled.filter((r) => !r.ok);
+        if (failedAttempts.length > 0) {
+          const sampleFailures = failedAttempts
+            .slice(0, 3)
+            .map((r) => r.requestLabel)
+            .join(" / ");
+          return {
+            ok: false,
+            rows: [],
+            apiType: "nitemtrade",
+            error: `${productKey} 2026년 이후 API 요청 ${allPart.settled.length}건 중 ${failedAttempts.length}건이 끝까지 실패했습니다. 잠시 후 다시 시도해 주세요.${sampleFailures ? ` 예시: ${sampleFailures}` : ""}`,
+          };
+        }
+        apiRows = allPart.rows;
+      } else {
+        const apiPart = await runNitemtradeForCountry(
+          countryId,
+          serviceKey,
+          tradeDirection,
+          common,
+          hsList,
+          apiWindows,
+        );
+        const failedAttempts = apiPart.settled.filter((r) => !r.ok);
+        if (failedAttempts.length > 0) {
+          const sampleFailures = failedAttempts
+            .slice(0, 3)
+            .map((r) => r.requestLabel)
+            .join(" / ");
+          return {
+            ok: false,
+            rows: [],
+            apiType: "nitemtrade",
+            error: `${productKey} 2026년 이후 API 요청 ${apiPart.settled.length}건 중 ${failedAttempts.length}건이 끝까지 실패했습니다. 잠시 후 다시 시도해 주세요.${sampleFailures ? ` 예시: ${sampleFailures}` : ""}`,
+          };
+        }
+        apiRows = apiPart.rows;
       }
-      apiRows = apiPart.rows;
       if (apiWindows.length > 0) {
-        notices.push("철강재 2026년 이후는 관세청 API에서 조회했습니다.");
+        notices.push(`${productKey} 2026년 이후는 관세청 API에서 조회했습니다.`);
       }
     }
 

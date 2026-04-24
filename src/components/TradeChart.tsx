@@ -76,6 +76,47 @@ function buildChartExportFileName(stem: string, line: RightLineMode): string {
   return `${core}-${suffix}`;
 }
 
+export function TradeChartLoadingSkeleton() {
+  const bars = [44, 68, 52, 74, 48, 62, 40, 70, 54, 64];
+
+  return (
+    <div className="flex w-full flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="chart-skeleton-pulse h-7 w-44 rounded-full" />
+          <div className="chart-skeleton-pulse h-7 w-36 rounded-full" />
+          <div className="chart-skeleton-pulse h-7 w-28 rounded-full" />
+        </div>
+        <div className="chart-skeleton-pulse h-7 w-16 rounded-full" />
+      </div>
+      <div className="chart-skeleton-shell relative mx-auto flex w-full min-w-0 max-w-[880px] aspect-[4/3] min-h-[280px] overflow-hidden rounded-[22px] p-5">
+        <div className="absolute inset-x-5 bottom-9 h-px bg-neutral-300" />
+        <div className="absolute bottom-9 left-5 top-5 w-px bg-neutral-300" />
+        <div className="absolute inset-0 overflow-hidden">
+          <div className="chart-skeleton-shimmer absolute inset-y-0 -left-1/3 w-1/3" />
+        </div>
+        <div className="relative mt-auto flex h-full items-end gap-3">
+          {bars.map((height, index) => (
+            <div
+              key={`skeleton-bar-${index}`}
+              className="flex min-w-0 flex-1 items-end gap-2"
+            >
+              <div
+                className="chart-skeleton-bar w-full rounded-t-sm"
+                style={{ height: `${height}%`, animationDelay: `${index * 120}ms` }}
+              />
+              <div
+                className="chart-skeleton-line w-1.5 rounded-full"
+                style={{ height: `${Math.max(28, height - 8)}%`, animationDelay: `${index * 120 + 80}ms` }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function TradeChart({
   categories,
   months,
@@ -374,11 +415,11 @@ export function TradeChart({
           <span className="text-sm font-bold uppercase tracking-[0.18em] text-neutral-500">
             우측 선
           </span>
-          <div className="glass-field inline-flex rounded-full p-0.5">
+          <div className="glass-field inline-flex rounded-full p-0.5 text-xs">
             <button
               type="button"
               onClick={() => setRightLine("unitPrice")}
-              className={`rounded-full px-3 py-1 text-[10px] font-semibold transition-colors ${
+              className={`rounded-full px-3 py-1 !text-[12px] font-semibold transition-colors ${
                 rightLine === "unitPrice"
                   ? "bg-[#303030] text-white shadow-sm"
                   : "text-neutral-600 hover:bg-white/48 hover:text-[#303030]"
@@ -389,7 +430,7 @@ export function TradeChart({
             <button
               type="button"
               onClick={() => setRightLine("yoy")}
-              className={`rounded-full px-3 py-1 text-[10px] font-semibold transition-colors ${
+              className={`rounded-full px-3 py-1 !text-[12px] font-semibold transition-colors ${
                 rightLine === "yoy"
                   ? "bg-[#303030] text-white shadow-sm"
                   : "text-neutral-600 hover:bg-white/48 hover:text-[#303030]"
@@ -411,7 +452,7 @@ export function TradeChart({
         <button
           type="button"
           onClick={handleSaveImage}
-          className="glass-field inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-semibold text-[#303030] transition hover:bg-white/58 focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
+          className="glass-field inline-flex items-center gap-1 rounded-full px-2 py-1 !text-[12px] font-semibold text-[#303030] transition hover:bg-white/58 focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
         >
           <span
             className="relative h-3.5 w-3.5"
