@@ -43,7 +43,7 @@ const metadataBase = resolveMetadataBaseUrl();
 
 export const metadata: Metadata = {
   metadataBase,
-  title: "철강 수출입 대시보드",
+  title: "Steel Trade Data",
   description: "수출입 공공데이터 시각화 (초기 레이아웃)",
   manifest: "/manifest.webmanifest",
   icons: {
