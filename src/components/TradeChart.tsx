@@ -1,11 +1,13 @@
 "use client";
 
+import { init } from "echarts";
 import type { EChartsOption } from "echarts";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactECharts from "echarts-for-react";
 
 /** 우측 파란 선: 단가(표와 동일 지표) 또는 중량 전년동월 증감률 */
 type RightLineMode = "unitPrice" | "yoy";
+type ExportSizeMode = "compact" | "wide";
 
 type TradeChartProps = {
   /** X축 라벨 (예: 2020.01 또는 2020) */
@@ -36,9 +38,30 @@ type TradeChartProps = {
 
 const BAR_GRAY = "#c0c0c0";
 const LINE_BLUE = "#003399";
+const CHART_FONT_FAMILY = '"NanumGothic", ui-sans-serif, system-ui, sans-serif';
+const EXPORT_BAR_GRAY = "#bfbfbf";
+const EXPORT_SIZE_PRESETS: Record<ExportSizeMode, { height: number; width: number }> = {
+  compact: { height: 199, width: 281 },
+  wide: { height: 233, width: 446 },
+};
+const PT_TO_PX = 96 / 72;
+const EXPORT_FONT_SIZE = 8 * PT_TO_PX;
+const EXPORT_LEGEND_FONT_SIZE = 9 * PT_TO_PX;
+const EXPORT_UNIT_FONT_SIZE = 9 * PT_TO_PX;
+const EXPORT_AXIS_WIDTH = 1;
+const EXPORT_LINE_WIDTH = 1 * PT_TO_PX;
 
 function finiteNumbers(values: (number | null | undefined)[]): number[] {
   return values.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const midpoint = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[midpoint - 1] + sorted[midpoint]) / 2
+    : sorted[midpoint];
 }
 
 function nextMagnitudeStep(maxValue: number): number {
@@ -74,6 +97,22 @@ function buildChartExportFileName(stem: string, line: RightLineMode): string {
   const suffix = line === "unitPrice" ? "단가" : "증감률";
   const core = base.length > 0 ? base : "chart";
   return `${core}-${suffix}`;
+}
+
+function waitForNextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+async function waitForChartFont(size: string): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts) return;
+
+  await Promise.allSettled([
+    document.fonts.load(`400 ${size} "NanumGothic"`),
+    document.fonts.load(`700 ${size} "NanumGothic"`),
+    document.fonts.ready,
+  ]);
 }
 
 export function TradeChartLoadingSkeleton() {
@@ -132,7 +171,32 @@ export function TradeChart({
   saveImageNameStem,
 }: TradeChartProps) {
   const [rightLine, setRightLine] = useState<RightLineMode>("yoy");
+  const [exportSize, setExportSize] = useState<ExportSizeMode>("compact");
+  const [chartFontReady, setChartFontReady] = useState(false);
   const chartRef = useRef<ReactECharts>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    if (typeof document === "undefined" || !document.fonts) {
+      Promise.resolve().then(() => {
+        if (isMounted) setChartFontReady(true);
+      });
+      return;
+    }
+
+    waitForChartFont("14px").then(() => {
+      if (!isMounted) return;
+      setChartFontReady(true);
+      requestAnimationFrame(() => {
+        chartRef.current?.getEchartsInstance().resize();
+      });
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const hasData =
     categories.length > 0 &&
@@ -171,19 +235,16 @@ export function TradeChart({
     () => buildChartExportFileName(saveImageNameStem, rightLine),
     [rightLine, saveImageNameStem],
   );
+  const exportDimensions = EXPORT_SIZE_PRESETS[exportSize];
 
-  const handleSaveImage = () => {
-    const instance = chartRef.current?.getEchartsInstance();
-    if (!instance) return;
-    const url = instance.getDataURL({
-      type: "png",
-      pixelRatio: 2,
-      backgroundColor: "#ffffff",
-    });
+  const downloadChartImage = (url: string) => {
     const link = document.createElement("a");
     link.href = url;
     link.download = `${saveImageFileName}.png`;
+    link.style.display = "none";
+    document.body.appendChild(link);
     link.click();
+    link.remove();
   };
 
   const n = categories.length;
@@ -212,33 +273,50 @@ export function TradeChart({
     };
   }, [rightLine, unitPrices, yoyPctWeight]);
 
+  const useYDataZoom = useMemo(() => {
+    if (!hasData) return false;
+
+    const finiteBars = finiteNumbers(barValues);
+    const finiteLine =
+      rightLine === "unitPrice" ? finiteNumbers(unitPrices) : finiteNumbers(yoyPctWeight);
+    const barMedian = median(finiteBars);
+    const lineMedian = median(finiteLine.map((value) => Math.abs(value)));
+    const barHasSpike = barMedian > 0 && Math.max(...finiteBars, 0) >= barMedian * 2.4;
+    const lineHasSpike =
+      rightLine === "yoy"
+        ? rightAxisRange.max - rightAxisRange.min >= 100
+        : lineMedian > 0 && Math.max(...finiteLine, 0) >= lineMedian * 2.4;
+
+    return barHasSpike || lineHasSpike;
+  }, [barValues, hasData, rightAxisRange, rightLine, unitPrices, yoyPctWeight]);
+
   const option: EChartsOption = useMemo(() => {
     if (!hasData) return {};
 
     const leftAxis: EChartsOption["yAxis"] = {
       type: "value",
-      name: leftUnit,
+      name: "",
       nameLocation: "end",
-      nameTextStyle: { align: "left", color: "#444", fontSize: 14 },
+      nameTextStyle: { align: "left", color: "#444", fontFamily: CHART_FONT_FAMILY, fontSize: 14 },
       position: "left",
       axisLine: { show: true, lineStyle: { color: "#999" } },
       axisTick: { show: true },
       splitLine: { show: false },
-      axisLabel: { color: "#555", fontSize: 14 },
+      axisLabel: { color: "#555", fontFamily: CHART_FONT_FAMILY, fontSize: 14 },
       min: 0,
       max: leftAxisMax,
     };
 
     const rightAxis: EChartsOption["yAxis"] = {
       type: "value",
-      name: rightAxisUnit,
+      name: "",
       nameLocation: "end",
-      nameTextStyle: { align: "right", color: "#444", fontSize: 14 },
+      nameTextStyle: { align: "right", color: "#444", fontFamily: CHART_FONT_FAMILY, fontSize: 14 },
       position: "right",
       axisLine: { show: true, lineStyle: { color: "#999" } },
       axisTick: { show: true },
       splitLine: { show: false },
-      axisLabel: { color: "#555", fontSize: 14 },
+      axisLabel: { color: "#555", fontFamily: CHART_FONT_FAMILY, fontSize: 14 },
       min: rightAxisRange.min,
       max: rightAxisRange.max,
       scale: true,
@@ -261,36 +339,61 @@ export function TradeChart({
       return "";
     };
 
-    const dataZoom: EChartsOption["dataZoom"] = useDataZoom
-      ? [
-          {
-            type: "inside",
-            xAxisIndex: 0,
-            filterMode: "none",
-            zoomOnMouseWheel: true,
-            moveOnMouseMove: true,
+    const dataZoom: Exclude<EChartsOption["dataZoom"], undefined> = [];
+
+    if (useDataZoom) {
+      dataZoom.push(
+        {
+          type: "inside",
+          xAxisIndex: 0,
+          filterMode: "none",
+          zoomOnMouseWheel: true,
+          moveOnMouseMove: true,
+        },
+        {
+          type: "slider",
+          xAxisIndex: 0,
+          filterMode: "none",
+          height: 22,
+          bottom: 8,
+          handleStyle: { color: "#94a3b8" },
+          dataBackground: {
+            areaStyle: { color: "#e2e8f0" },
+            lineStyle: { color: "#cbd5e1" },
           },
-          {
-            type: "slider",
-            xAxisIndex: 0,
-            filterMode: "none",
-            height: 22,
-            bottom: 8,
-            handleStyle: { color: "#94a3b8" },
-            dataBackground: {
-              areaStyle: { color: "#e2e8f0" },
-              lineStyle: { color: "#cbd5e1" },
-            },
-          },
-        ]
-      : undefined;
+          textStyle: { fontFamily: CHART_FONT_FAMILY },
+        },
+      );
+    }
+
+    if (useYDataZoom) {
+      dataZoom.push({
+        type: "slider",
+        yAxisIndex: [0, 1],
+        filterMode: "none",
+        width: 18,
+        right: 8,
+        top: 94,
+        bottom: useDataZoom ? 56 : 44,
+        handleStyle: { color: "#94a3b8" },
+        dataBackground: {
+          areaStyle: { color: "#e2e8f0" },
+          lineStyle: { color: "#cbd5e1" },
+        },
+        textStyle: { fontFamily: CHART_FONT_FAMILY },
+      });
+    }
 
     return {
       color: [BAR_GRAY, LINE_BLUE],
       animation: n < 400,
+      textStyle: {
+        fontFamily: CHART_FONT_FAMILY,
+      },
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "cross" },
+        textStyle: { fontFamily: CHART_FONT_FAMILY },
         formatter: (params: unknown) => {
           if (!Array.isArray(params) || params.length === 0) return "";
           const axis = params[0] as { axisValue?: string; dataIndex?: number };
@@ -308,7 +411,7 @@ export function TradeChart({
             rightLine === "unitPrice"
               ? `${lineLegend}: ${upStr} (표와 동일)`
               : `${lineLegend}: ${fmtPct(yoyPctWeight[idx])} (중량·${yoyComparisonLabel})`;
-          return `<div style="font-size:12px;line-height:1.55"><strong>${cat}</strong><br/>${barLegend}: ${b?.toLocaleString(undefined, { maximumFractionDigits: 2 })} 천톤<br/>${linePrimary}<br/>────────<br/>금액 YoY: ${fmtPct(yoyPctAmount[idx])}<br/>${imexLabel}단가: ${upStr}<br/>단가 YoY: ${fmtPct(yoyPctUnitPrice[idx])}</div>`;
+          return `<div style="font-family:${CHART_FONT_FAMILY};font-size:12px;line-height:1.55"><strong>${cat}</strong><br/>${barLegend}: ${b?.toLocaleString(undefined, { maximumFractionDigits: 2 })} 천톤<br/>${linePrimary}<br/>────────<br/>금액 YoY: ${fmtPct(yoyPctAmount[idx])}<br/>${imexLabel}단가: ${upStr}<br/>단가 YoY: ${fmtPct(yoyPctUnitPrice[idx])}</div>`;
         },
       },
       legend: {
@@ -316,17 +419,39 @@ export function TradeChart({
         top: 20,
         orient: "horizontal",
         itemGap: 20,
-        textStyle: { fontSize: 14, color: "#333" },
+        textStyle: { fontFamily: CHART_FONT_FAMILY, fontSize: 14, color: "#333" },
         data: [barLegend, lineLegend],
       },
+      graphic: [
+        {
+          type: "text",
+          left: 24,
+          top: 62,
+          style: {
+            text: leftUnit,
+            fill: "#444",
+            font: `14px ${CHART_FONT_FAMILY}`,
+          },
+        },
+        {
+          type: "text",
+          right: useYDataZoom ? 60 : 30,
+          top: 62,
+          style: {
+            text: rightAxisUnit,
+            fill: "#444",
+            font: `14px ${CHART_FONT_FAMILY}`,
+          },
+        },
+      ],
       grid: {
         left: 56,
-        right: 56,
+        right: useYDataZoom ? 82 : 56,
         top: 94,
         bottom: useDataZoom ? 56 : 44,
         containLabel: false,
       },
-      dataZoom,
+      dataZoom: dataZoom.length > 0 ? dataZoom : undefined,
       xAxis: {
         type: "category",
         data: categories,
@@ -335,6 +460,7 @@ export function TradeChart({
         axisTick: { show: true, alignWithLabel: true },
         axisLabel: {
           color: "#555",
+          fontFamily: CHART_FONT_FAMILY,
           fontSize: 14,
           interval: 0,
           formatter: xAxisLabelFormatter,
@@ -385,6 +511,7 @@ export function TradeChart({
     rightLine,
     n,
     useDataZoom,
+    useYDataZoom,
     lineData,
     yoyPctAmount,
     yoyPctUnitPrice,
@@ -393,6 +520,243 @@ export function TradeChart({
     imexLabel,
     yoyComparisonLabel,
   ]);
+
+  const exportOption: EChartsOption = useMemo(() => {
+    if (!hasData) return {};
+
+    const exportAxisLine = {
+      show: true,
+      lineStyle: { color: "#000000", width: EXPORT_AXIS_WIDTH },
+    };
+    const exportAxisTick = {
+      show: true,
+      lineStyle: { color: "#000000", width: EXPORT_AXIS_WIDTH },
+    };
+    const exportTextStyle = {
+      color: "#000000",
+      fontFamily: CHART_FONT_FAMILY,
+      fontSize: EXPORT_FONT_SIZE,
+    };
+    const graphicLegendTextStyle = {
+      fill: "#000000",
+      font: `${EXPORT_LEGEND_FONT_SIZE}px ${CHART_FONT_FAMILY}`,
+    };
+    const graphicUnitTextStyle = {
+      fill: "#000000",
+      font: `${EXPORT_UNIT_FONT_SIZE}px ${CHART_FONT_FAMILY}`,
+    };
+
+    const xAxisLabelFormatter = (value: string, index: number) => {
+      const yearly = /^(\d{4})$/.exec(String(value));
+      if (yearly) return `${yearly[1].slice(-2)}'`;
+
+      const monthly = /^(\d{4})\.(\d{2})$/.exec(String(value));
+      if (!monthly) return String(value);
+      const yy = monthly[1].slice(-2);
+      const mm = monthly[2];
+      const mCompact = String(Number(mm));
+      const monthNumber = Number(mm);
+      if (index === 0) return n >= 60 ? `${yy}'` : `${yy}.${mCompact}`;
+      if (n >= 60) return mm === "01" ? `${yy}'` : "";
+      const interval = n > 24 ? 6 : 3;
+      if ((monthNumber - 1) % interval === 0) return `${yy}.${mCompact}`;
+      return "";
+    };
+    const visibleXAxisTickValues = categories.filter(
+      (value, index) => xAxisLabelFormatter(value, index) !== "",
+    );
+
+    return {
+      animation: false,
+      backgroundColor: "#ffffff",
+      color: [EXPORT_BAR_GRAY, LINE_BLUE],
+      textStyle: {
+        fontFamily: CHART_FONT_FAMILY,
+        fontSize: EXPORT_FONT_SIZE,
+      },
+      legend: { show: false },
+      graphic: [
+        {
+          type: "text",
+          left: 10,
+          top: 10,
+          style: { ...graphicUnitTextStyle, text: leftUnit },
+        },
+        {
+          type: "text",
+          right: 4,
+          top: 10,
+          style: { ...graphicUnitTextStyle, text: rightAxisUnit },
+        },
+        {
+          type: "rect",
+          left: 58,
+          top: 16,
+          shape: { width: 30, height: 5.2 },
+          style: { fill: EXPORT_BAR_GRAY },
+        },
+        {
+          type: "text",
+          left: 100,
+          top: 12,
+          style: { ...graphicLegendTextStyle, text: barLegend },
+        },
+        {
+          type: "rect",
+          left: 58,
+          top: 31,
+          shape: { width: 30, height: EXPORT_LINE_WIDTH },
+          style: { fill: LINE_BLUE },
+        },
+        {
+          type: "text",
+          left: 100,
+          top: 26,
+          style: { ...graphicLegendTextStyle, text: lineLegend },
+        },
+      ],
+      grid: {
+        left: 44,
+        right: 36,
+        top: 37,
+        bottom: 22,
+        containLabel: false,
+      },
+      tooltip: { show: false },
+      dataZoom: undefined,
+      xAxis: {
+        type: "category",
+        data: categories,
+        boundaryGap: true,
+        axisLine: exportAxisLine,
+        axisTick: {
+          ...exportAxisTick,
+          alignWithLabel: true,
+          customValues: visibleXAxisTickValues,
+        },
+        splitLine: { show: false },
+        axisLabel: {
+          ...exportTextStyle,
+          interval: 0,
+          formatter: xAxisLabelFormatter,
+        },
+      },
+      yAxis: [
+        {
+          type: "value",
+          name: "",
+          nameLocation: "end",
+          nameGap: 7,
+          nameTextStyle: { ...exportTextStyle, align: "left", verticalAlign: "bottom" },
+          position: "left",
+          axisLine: exportAxisLine,
+          axisTick: exportAxisTick,
+          splitLine: { show: false },
+          axisLabel: exportTextStyle,
+          min: 0,
+          max: leftAxisMax,
+        },
+        {
+          type: "value",
+          name: "",
+          nameLocation: "end",
+          nameGap: 7,
+          nameTextStyle: { ...exportTextStyle, align: "right", verticalAlign: "bottom" },
+          position: "right",
+          axisLine: exportAxisLine,
+          axisTick: exportAxisTick,
+          splitLine: { show: false },
+          axisLabel: exportTextStyle,
+          min: rightAxisRange.min,
+          max: rightAxisRange.max,
+          scale: true,
+        },
+      ],
+      series: [
+        {
+          name: barLegend,
+          type: "bar",
+          yAxisIndex: 0,
+          data: barValues,
+          barMaxWidth: n > 80 ? 4 : 12,
+          barCategoryGap: n > 80 ? "25%" : "48%",
+          itemStyle: {
+            color: EXPORT_BAR_GRAY,
+            borderColor: EXPORT_BAR_GRAY,
+            borderWidth: EXPORT_AXIS_WIDTH,
+            borderRadius: 0,
+          },
+          large: n > 800,
+          largeThreshold: 400,
+        },
+        {
+          name: lineLegend,
+          type: "line",
+          yAxisIndex: 1,
+          data: lineData,
+          smooth: true,
+          showSymbol: false,
+          connectNulls: true,
+          lineStyle: { width: EXPORT_LINE_WIDTH, color: LINE_BLUE },
+          itemStyle: { color: LINE_BLUE },
+        },
+      ],
+    };
+  }, [
+    barLegend,
+    barValues,
+    categories,
+    hasData,
+    leftUnit,
+    leftAxisMax,
+    lineLegend,
+    rightAxisUnit,
+    rightAxisRange,
+    n,
+    lineData,
+  ]);
+
+  const handleSaveImage = async () => {
+    if (!hasData || typeof document === "undefined") return;
+
+    try {
+      await waitForChartFont("8pt");
+
+      const container = document.createElement("div");
+      container.style.position = "fixed";
+      container.style.left = `-${exportDimensions.width * 2}px`;
+      container.style.top = "0";
+      container.style.width = `${exportDimensions.width}px`;
+      container.style.height = `${exportDimensions.height}px`;
+      container.style.pointerEvents = "none";
+      document.body.appendChild(container);
+
+      const exportChart = init(container, null, {
+        renderer: "canvas",
+        width: exportDimensions.width,
+        height: exportDimensions.height,
+        devicePixelRatio: 1,
+      });
+
+      try {
+        exportChart.setOption(exportOption, true);
+        await waitForNextFrame();
+        await waitForNextFrame();
+        downloadChartImage(
+          exportChart.getDataURL({
+            type: "png",
+            pixelRatio: 1,
+            backgroundColor: "#ffffff",
+          }),
+        );
+      } finally {
+        exportChart.dispose();
+        container.remove();
+      }
+    } catch (error) {
+      console.error("Failed to export chart image", error);
+    }
+  };
 
   if (!hasData) {
     return (
@@ -449,25 +813,42 @@ export function TradeChart({
           ) : null}
         </div>
 
-        <button
-          type="button"
-          onClick={handleSaveImage}
-          className="glass-field inline-flex items-center gap-1 rounded-full px-2 py-1 !text-[12px] font-semibold text-[#303030] transition hover:bg-white/58 focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
-        >
-          <span
-            className="relative h-3.5 w-3.5"
-            aria-hidden="true"
+        <div className="flex items-center gap-2">
+          <select
+            value={exportSize}
+            onChange={(event) => setExportSize(event.target.value as ExportSizeMode)}
+            className="glass-field rounded-full px-2 py-1 !text-[12px] font-semibold text-[#303030] focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
+            aria-label="PNG 저장 크기"
           >
-            <span className="absolute bottom-0 left-0 h-px w-full bg-[#303030]" />
-            <span className="absolute left-1/2 top-0 h-2.5 w-px -translate-x-1/2 bg-[#303030]" />
-            <span className="absolute left-1/2 top-[5px] h-1.5 w-1.5 -translate-x-1/2 rotate-45 border-b border-r border-[#303030]" />
-          </span>
-          저장
-        </button>
+            <option value="compact">기본</option>
+            <option value="wide">가로 확장</option>
+          </select>
+          <button
+            type="button"
+            onClick={() => {
+              void handleSaveImage();
+            }}
+            className="glass-field inline-flex items-center gap-1 rounded-full px-2 py-1 !text-[12px] font-semibold text-[#303030] transition hover:bg-white/58 focus:outline-none focus:ring-2 focus:ring-yellow-300/70"
+          >
+            <span
+              className="relative h-3.5 w-3.5"
+              aria-hidden="true"
+            >
+              <span className="absolute bottom-0 left-0 h-px w-full bg-[#303030]" />
+              <span className="absolute left-1/2 top-0 h-2.5 w-px -translate-x-1/2 bg-[#303030]" />
+              <span className="absolute left-1/2 top-[5px] h-1.5 w-1.5 -translate-x-1/2 rotate-45 border-b border-r border-[#303030]" />
+            </span>
+            저장
+          </button>
+        </div>
       </div>
-      <div className="relative mx-auto w-full min-w-0 max-w-[880px] aspect-[4/3] min-h-[208px] overflow-hidden rounded-lg bg-white">
+      <div
+        className="relative mx-auto w-full min-w-0 max-w-[880px] aspect-[4/3] min-h-[208px] overflow-hidden rounded-lg bg-white"
+        style={{ fontFamily: CHART_FONT_FAMILY }}
+      >
         <div className="absolute inset-0 min-h-[208px]">
           <ReactECharts
+            key={chartFontReady ? "nanum-gothic-ready" : "nanum-gothic-loading"}
             ref={chartRef}
             option={option}
             style={{ height: "100%", width: "100%" }}

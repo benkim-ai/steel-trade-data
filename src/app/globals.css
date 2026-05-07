@@ -1,5 +1,21 @@
 @import "tailwindcss";
 
+@font-face {
+  font-family: "NanumGothic";
+  src: url("/fonts/NanumGothic.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: "NanumGothic";
+  src: url("/fonts/NanumGothicBold.ttf") format("truetype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 700;
+}
+
 :root {
   --background: #fbfcdb;
   --foreground: #303030;
