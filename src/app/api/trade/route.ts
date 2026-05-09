@@ -15,7 +15,7 @@ import { HS_CODE_MAP } from "@/constants/hsCodes";
 import { COUNTRY_FILTER_ALL } from "@/constants/mappings";
 import { mergeRowsByMonth, parseTradeXmlToRows } from "@/lib/tradeXmlNormalize";
 import type { TradeXmlDirection } from "@/lib/tradeXmlNormalize";
-import { splitYymmRangeInclusive } from "@/lib/yymmChunk";
+import { splitYymmRangeInclusive, yymmAddMonths } from "@/lib/yymmChunk";
 import type {
   TradeApiType,
   TradeApiResponse,
@@ -58,6 +58,22 @@ function normalizeYymmParam(raw: string | null): string | null {
 
 function yymmToMonthStartDate(yymm: string): string {
   return `${yymm.slice(0, 4)}-${yymm.slice(4, 6)}-01`;
+}
+
+function fillMissingMonthsWithZeroRows(
+  rows: TradeRow[],
+  startYymm: string,
+  endYymm: string,
+): TradeRow[] {
+  const byMonth = new Map(rows.map((row) => [row.month, row]));
+  const filled: TradeRow[] = [];
+
+  for (let cur = startYymm; cur <= endYymm; cur = yymmAddMonths(cur, 1)) {
+    const month = `${cur.slice(0, 4)}-${cur.slice(4, 6)}`;
+    filled.push(byMonth.get(month) ?? { month, weight: 0, amount: 0 });
+  }
+
+  return filled;
 }
 
 function maskServiceKeyInUrl(url: string): string {
@@ -620,9 +636,14 @@ async function handleNitemtrade(
       }
     }
 
+    const mergedRows = mergeRowsByMonth([...supabaseRows, ...apiRows]);
     return {
       ok: true,
-      rows: mergeRowsByMonth([...supabaseRows, ...apiRows]),
+      rows: fillMissingMonthsWithZeroRows(
+        mergedRows,
+        common.normalizedStart,
+        common.normalizedEnd,
+      ),
       apiType: "nitemtrade",
       notice: notices.join(" "),
     };
@@ -686,7 +707,11 @@ async function handleNitemtrade(
 
   return {
     ok: true,
-    rows: merged,
+    rows: fillMissingMonthsWithZeroRows(
+      merged,
+      common.normalizedStart,
+      common.normalizedEnd,
+    ),
     apiType: "nitemtrade",
     notice:
       merged.length === 0
@@ -806,7 +831,11 @@ async function handleContinentProduct(
 
   return {
     ok: true,
-    rows,
+    rows: fillMissingMonthsWithZeroRows(
+      rows,
+      common.normalizedStart,
+      common.normalizedEnd,
+    ),
     apiType: "continent",
     notice:
       rows.length === 0
