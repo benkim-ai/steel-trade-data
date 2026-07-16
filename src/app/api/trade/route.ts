@@ -735,11 +735,9 @@ async function handleNitemtrade(
   };
 }
 
-const KOSA_CONTINENT_TABLE = process.env.KOSA_CONTINENT_TABLE?.trim() || "kosa_trade_data";
-
 /**
  * 품목·대륙별(KOSA/Supabase)
- * - flow_type(import|export), item_name, region_name, year_month 범위로 조회
+ * - 대륙 행도 `kosa_steel_country_data.country_name`에 적재되어 있어 국가별 테이블을 함께 사용
  * - qty(톤), amount(USD)을 월별 합산 후 qty는 천톤, amount는 백만USD로 변환
  */
 async function handleContinentProduct(
@@ -777,72 +775,34 @@ async function handleContinentProduct(
     };
   }
 
-  const supabase = getSupabaseServerClient();
-  if (!supabase) {
+  const supabasePart = await fetchCountryProductRowsFromSupabase(
+    tradeDirection,
+    productKey,
+    getCountryTableNameAliases(regionName),
+    common.normalizedStart,
+    common.normalizedEnd,
+  );
+  if (supabasePart.error) {
     return {
       ok: false,
       rows: [],
       apiType: "continent",
-      error:
-        "Supabase 환경변수(SUPABASE_URL, SUPABASE_SERVICE_KEY)가 설정되지 않았습니다.",
+      error: supabasePart.error,
     };
   }
-
-  const mappedItemName = mapUiProductToKosaItemName(productKey);
-  const startDate = yymmToMonthStartDate(common.normalizedStart);
-  const endDate = yymmToMonthStartDate(common.normalizedEnd);
-  const { data, error } = await supabase
-    .from(KOSA_CONTINENT_TABLE)
-    .select("year_month, qty, amount")
-    .eq("flow_type", tradeDirection)
-    .eq("item_name", mappedItemName)
-    .eq("region_name", regionName)
-    .gte("year_month", startDate)
-    .lte("year_month", endDate)
-    .order("year_month", { ascending: true });
-
-  if (error) {
-    return {
-      ok: false,
-      rows: [],
-      apiType: "continent",
-      error: `대륙별 Supabase 조회 실패: ${error.message}`,
-    };
-  }
-
-  const monthly = new Map<string, { qty: number; amountUsd: number }>();
-  for (const r of data ?? []) {
-    const ym = String((r as { year_month: unknown }).year_month ?? "").replace(/\D/g, "").slice(0, 6);
-    if (!/^\d{6}$/.test(ym)) continue;
-    const month = `${ym.slice(0, 4)}-${ym.slice(4, 6)}`;
-    const qty = Number((r as { qty: unknown }).qty ?? 0);
-    const amountUsd = Number((r as { amount: unknown }).amount ?? 0);
-    const cur = monthly.get(month) ?? { qty: 0, amountUsd: 0 };
-    cur.qty += Number.isFinite(qty) ? qty : 0;
-    cur.amountUsd += Number.isFinite(amountUsd) ? amountUsd : 0;
-    monthly.set(month, cur);
-  }
-
-  const rows: TradeRow[] = [...monthly.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([month, v]) => ({
-      month,
-      weight: Math.round((v.qty / 1000) * 1_000_000) / 1_000_000,
-      amount: Math.round((v.amountUsd / 1_000_000) * 1_000_000) / 1_000_000,
-    }));
 
   return {
     ok: true,
     rows: fillMissingMonthsWithZeroRows(
-      rows,
+      supabasePart.rows,
       common.normalizedStart,
       common.normalizedEnd,
     ),
     apiType: "continent",
     notice:
-      rows.length === 0
-        ? "대륙별 Supabase 조회 결과가 비어 있습니다. 조건(flow_type/item_name/region_name/year_month)을 확인하세요."
-        : `대륙별은 Supabase(${KOSA_CONTINENT_TABLE})에서 조회했습니다. item_name="${mappedItemName}", region_name="${regionName}"`,
+      supabasePart.rows.length === 0
+        ? "대륙별 Supabase 조회 결과가 비어 있습니다. 조건(flow_type/item_name/country_name/year_month)을 확인하세요."
+        : `대륙별은 Supabase(${COUNTRY_PRODUCT_TABLE})에서 조회했습니다. country_name="${regionName}"`,
   };
 }
 
