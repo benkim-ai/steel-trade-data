@@ -114,7 +114,9 @@ const DEFAULT_PAGE_NO = "1";
 const DEFAULT_NUM_OF_ROWS = "999";
 const COUNTRY_PRODUCT_TABLE =
   process.env.KOSA_STEEL_COUNTRY_TABLE?.trim() || "kosa_steel_country_data";
-const COUNTRY_PRODUCT_SUPABASE_END_YYMM = "202512";
+const COUNTRY_PRODUCT_SUPABASE_END_YYMM = "202606";
+const COUNTRY_PRODUCT_SUPABASE_END_LABEL = `${COUNTRY_PRODUCT_SUPABASE_END_YYMM.slice(0, 4)}-${COUNTRY_PRODUCT_SUPABASE_END_YYMM.slice(4, 6)}`;
+const COUNTRY_PRODUCT_API_START_YYMM = yymmAddMonths(COUNTRY_PRODUCT_SUPABASE_END_YYMM, 1);
 
 /** 관세청 GW가 한 번에 긴 기간을 잘라 주는 경우가 있어, 최대 이 개월 단위로 나눠 호출 후 합산 */
 const API_YXMM_CHUNK_MONTHS = 12;
@@ -469,7 +471,7 @@ async function fetchCountryProductRowsFromSupabase(
     rows,
     notice:
       rows.length > 0
-        ? `${productKey} 2025년까지는 Supabase(${COUNTRY_PRODUCT_TABLE})에서 조회했습니다. country_name=${countryNames.join("/")}, item_name=${itemAliases.join("/")}`
+        ? `${productKey} ${COUNTRY_PRODUCT_SUPABASE_END_LABEL}까지는 Supabase(${COUNTRY_PRODUCT_TABLE})에서 조회했습니다. country_name=${countryNames.join("/")}, item_name=${itemAliases.join("/")}`
         : undefined,
   };
 }
@@ -576,7 +578,7 @@ async function handleNitemtrade(
     const apiStart =
       common.normalizedStart > COUNTRY_PRODUCT_SUPABASE_END_YYMM
         ? common.normalizedStart
-        : "202601";
+        : COUNTRY_PRODUCT_API_START_YYMM;
 
     let apiRows: TradeRow[] = [];
     if (common.normalizedEnd >= apiStart) {
